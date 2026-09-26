@@ -108,6 +108,82 @@ public final class UpdateBatch {
       return true;
    }
 
+   // ── Lua capture-and-replay (entityUpdateLuaReplay) ─────────────────────────────────────────────────────────
+   //
+   // xD3I's AnimParallel pattern applied to the update batch: a worker mid-batch reaching triggerEvent appends
+   // (event, args…) to its task's capture list instead of dropping the dispatch; after the join the game thread
+   // walks the tasks in queue order — stock's serial event order — and fans each record back through the real
+   // triggerEvent overloads, still inside the bucket window so handlers run under the bucket's
+   // perObjectMultiplier exactly as stock's inline dispatch did (AnimParallel dispatches under useMultiplier for
+   // the same reason: ThumpState counts strikes over it). With the key off the guard counts and drops, as before.
+   private static java.util.ArrayList<Object[]>[] luaCaptures = newLuaCaptureArray(4096);
+   private static final ThreadLocal<java.util.ArrayList<Object[]>> LUA_CAPTURE = new ThreadLocal<>();
+   private static long luaCaptured, luaReplayed;
+
+   @SuppressWarnings("unchecked")
+   private static java.util.ArrayList<Object[]>[] newLuaCaptureArray(int size) {
+      return new java.util.ArrayList[size];
+   }
+
+   /**
+    * A worker mid-batch reached a {@code triggerEvent} overload (the override calls this from behind its
+    * {@link #onWorkerNow} guard): capture the dispatch for the game thread's replay, or count-and-drop when
+    * {@code entityUpdateLuaReplay} is off. The varargs array only ever allocates on this already-guarded path.
+    */
+   public static void captureLuaEvent(String event, Object... params) {
+      java.util.ArrayList<Object[]> list = LUA_CAPTURE.get();
+      if (list == null || !Config.ENTITY_UPDATE_LUA_REPLAY) {
+         onLuaSuppressed();
+         return;
+      }
+
+      Object[] record = new Object[params.length + 1];
+      record[0] = event;
+      System.arraycopy(params, 0, record, 1, params.length);
+      list.add(record);
+   }
+
+   /** Game thread, after the join: every task's captured events through the real dispatch, in queue order. */
+   private static void replayLuaEvents(int n) {
+      for (int i = 0; i < n; i++) {
+         java.util.ArrayList<Object[]> list = luaCaptures[i];
+         if (list == null || list.isEmpty()) {
+            continue;
+         }
+
+         luaCaptured += list.size();
+         for (int j = 0; j < list.size(); j++) {
+            Object[] r = list.get(j);
+            String e = (String) r[0];
+            switch (r.length) {
+               case 1 -> zombie.Lua.LuaEventManager.triggerEvent(e);
+               case 2 -> zombie.Lua.LuaEventManager.triggerEvent(e, r[1]);
+               case 3 -> zombie.Lua.LuaEventManager.triggerEvent(e, r[1], r[2]);
+               case 4 -> zombie.Lua.LuaEventManager.triggerEvent(e, r[1], r[2], r[3]);
+               case 5 -> zombie.Lua.LuaEventManager.triggerEvent(e, r[1], r[2], r[3], r[4]);
+               case 6 -> zombie.Lua.LuaEventManager.triggerEvent(e, r[1], r[2], r[3], r[4], r[5]);
+               case 7 -> zombie.Lua.LuaEventManager.triggerEvent(e, r[1], r[2], r[3], r[4], r[5], r[6]);
+               case 8 -> zombie.Lua.LuaEventManager.triggerEvent(e, r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
+               default -> zombie.Lua.LuaEventManager.triggerEvent(e, r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]);
+            }
+
+            luaReplayed++;
+         }
+
+         list.clear();
+      }
+   }
+
+   /** How many worker-fired Lua events the capture has taken this session. */
+   public static long getLuaCapturedCount() {
+      return luaCaptured;
+   }
+
+   /** How many captured Lua events the game thread has replayed this session. */
+   public static long getLuaReplayedCount() {
+      return luaReplayed;
+   }
+
    /** Game thread, after the join: apply the last latched square per entity through the real setMovingSquare. */
    private static void applyDeferredSquares() {
       IsoMovingObject entity;
@@ -239,12 +315,26 @@ public final class UpdateBatch {
          entity.pzoptSnapshotFrame = frame;
       }
 
+      boolean luaReplay = Config.ENTITY_UPDATE_LUA_REPLAY;
+      if (luaReplay && luaCaptures.length < n) {
+         luaCaptures = java.util.Arrays.copyOf(luaCaptures, Math.max(n, luaCaptures.length * 2));
+      }
+
       Throwable t;
       inFlight = true; // onWorkerNow() and frozen(): the workers are running this batch's entities from here to the finally
       try {
          t = FrameBatch.run(n, i -> {
             IsoMovingObject entity = queue[i];
             CURRENT.set(entity); // frozen(): this task's entity reads itself live, everyone else frozen
+            java.util.ArrayList<Object[]> capture = null;
+            if (luaReplay) {
+               capture = luaCaptures[i];
+               if (capture == null) {
+                  capture = new java.util.ArrayList<>();
+                  luaCaptures[i] = capture; // published to the game thread by the join
+               }
+               LUA_CAPTURE.set(capture); // captureLuaEvent appends here for this task
+            }
             try {
                entity.setCurrentSimulationLevel(level);
                entity.preupdate();
@@ -252,6 +342,9 @@ public final class UpdateBatch {
                entity.update();
             } finally {
                CURRENT.set(null); // a pooled worker must not carry the reference into the next task
+               if (capture != null) {
+                  LUA_CAPTURE.set(null);
+               }
             }
          });
       } finally {
@@ -261,6 +354,13 @@ public final class UpdateBatch {
       // The window's latched setMovingSquare calls, applied in one place on the game thread — also after a
       // failed batch, so a partially updated frame still lands its tile updates instead of leaking them.
       applyDeferredSquares();
+
+      // The window's captured Lua dispatches, in queue order — stock's serial event order — while the bucket's
+      // perObjectMultiplier is still set, so handlers see the same time scale as stock's inline dispatch. Also
+      // after a failed batch: events fired before the throw did fire in stock's semantics too.
+      if (luaReplay) {
+         replayLuaEvents(n);
+      }
       workNanos += FrameBatch.workNanos - w0;
       waitNanos += FrameBatch.waitNanos - q0;
       if (t != null) {
@@ -332,6 +432,7 @@ public final class UpdateBatch {
    public static String describe() {
       return "update batch: frames=" + frames + " batched=" + batched + " max=" + maxBatch
             + " work ms=" + (workNanos / 1_000_000L) + " wait ms=" + (waitNanos / 1_000_000L)
+            + " luaCaptured=" + luaCaptured + " luaReplayed=" + luaReplayed
             + " luaSuppressed=" + luaSuppressed.get() + " pathfindRaceSkipped=" + pathfindRaceSkipped.get()
             + " movingSquareDeferred=" + movingSquareDeferred
             + (failed ? " FAILED" : "");

@@ -4284,3 +4284,56 @@ pins frozen cross-entity reads (latch-ordered, no scheduling luck), live self-re
 staleness across batches and never-batched entities; `tests/pzopt/MovingSquareDeferralTest` pins stock behavior
 outside a window, the untouched shared list mid-window, the replay's end state, last-call-wins, and a batched
 update writing a non-queued entity's square.
+
+## zombie.Lua.LuaEventManager: worker events captured and replayed instead of dropped (`entityUpdateLuaReplay`)
+
+The first run summary with `UpdateBatch.describe()` wired in put a number on the drop guard's cost:
+`luaSuppressed=4,383,274` in a 26 s Louisville route — the per-zombie update event
+(`IsoZombie.updateInternal` → `triggerEvent`), deleted for every batched zombie every frame. In stock those
+handlers RUN, so part of the measured speedup was skipped work, and any mod hooking per-zombie events was
+silently dead while the batch was on. This applies the repo's own AnimParallel pattern (anim events captured on
+the workers, dispatched on the game thread in order) to the update batch.
+
+- Each `triggerEvent` overload's worker guard now routes to `UpdateBatch.captureLuaEvent(event, params…)`
+  instead of the drop counter (one line per overload, marked `pzopt: entityUpdateLuaReplay`). The varargs
+  array only allocates on the already-guarded worker path; the game-thread fast path is unchanged.
+- `UpdateBatch` keeps one pooled capture list per task; the runner points a ThreadLocal at the task's list
+  around the four update calls. After the join — after the deferred setMovingSquare replay, still inside the
+  bucket window — the game thread walks the tasks in queue order (stock's serial event order) and fans every
+  record back through the real `triggerEvent` overloads, so handlers run under the bucket's
+  `perObjectMultiplier` exactly as stock's inline dispatch did. Replay also runs after a failed batch: events
+  fired before the throw had fired in stock's semantics too.
+- Key `entityUpdateLuaReplay`, default on. Off = the previous count-and-drop guard, kept so the replay's
+  game-thread cost can be priced in an A/B. `describe()` carries `luaCaptured=`/`luaReplayed=` beside the
+  drop counter.
+
+`tests/pzopt/LuaEventReplayTest` pins the runtime counter flow (captured on the worker, zero mid-flight
+replays, replayed after the join, nothing dropped while the key is on) and, in bytecode, that the replay fans
+out through all nine `triggerEvent` overloads and every overload's guard routes to the capture funnel.
+`tests/pzopt/LuaEventGuardTest` keeps the guard pins and re-runs itself in a subprocess with the key off for
+the drop-mode runtime half (the bare JVM's null Lua state cannot take a replayed dispatch of the seven
+overloads that do not null-check `env`).
+
+## zombie.ai.ZombieGroupManager: the group list under one lock (`entityUpdateParallel`, new override)
+
+Run `lou-replay-on`, frame 928: a worker died with `NullPointerException: "idealSizeFactor" because "group" is
+null` in `findNearestGroup`, latching the batch off for the rest of the session. Root cause from the pinned
+jar: `groups` is a plain ArrayList and every batched zombie's `updateInternal` calls `update()` here —
+`findNearestGroup` iterates the list AND removes empties (`groups.remove(i--)`), `update()` adds groups,
+removes members and reads other groups' leaders, `preupdate()` sweeps, and the leader/member branches use the
+manager's shared `tempVec2`/`tempVec3` scratch. Concurrent iterate/add/remove on one ArrayList tears a slot;
+the joins are also gated on a global tick, so the race is bursty (one frame in thirty) and intermittent.
+
+Every group-touching section now runs under `synchronized (this.groups)`, the same idiom as the `lccMain` and
+`soundList` locks this repo already ships for PZMulticore's workers: the membership remove at `update()`'s
+entry, everything past the tick gate (join, leader spread, member follow — which also covers the tempVec
+scratch), the whole of `findNearestGroup` (reentrant under `update()`'s lock, locked itself for external
+callers), `preupdate()`'s sweep and `Reset()`. Uncontended on the stock path — the frame workers only exist
+while a batch is in flight — and the tick gate keeps the join block off 29 frames in 30.
+
+Key: `entityUpdateParallel`. A runtime hammer is not possible in a bare JVM (`findNearestGroup`'s first reads
+touch `SandboxOptions.instance`, whose initializer runs Lua through the game filesystem), so like the
+PathFindBehavior2 clone the evidence is structural plus the live run: `tests/pzopt/ZombieGroupGuardTest` pins
+in bytecode that the jar's methods hold no monitor (the lock is ours, and a TIS-added lock would be noticed)
+and that exactly `update`/`findNearestGroup`/`preupdate`/`Reset` in the override each hold one, with the
+method set otherwise identical to the jar's.

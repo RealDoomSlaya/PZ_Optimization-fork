@@ -241,9 +241,11 @@ public final class LuaEventManager implements JavaFunction {
    public static void triggerEvent(String event) {
       // pzopt: entityUpdateParallel. A frame worker mid-batch never dispatches a Lua event: the main-thread path
       // below writes the shared static argument slots a1..a8/a1index..a8index and the off-thread path takes the
-      // EventMap monitor and queues into a shared pool. Counted, first occurrence logged with its stack.
+      // EventMap monitor and queues into a shared pool. With entityUpdateLuaReplay (default on) the dispatch is
+      // captured and the game thread replays it in queue order after the join; with it off, counted and dropped,
+      // first occurrence logged with its stack.
       if (pzopt.UpdateBatch.onWorkerNow()) { // pzopt: entityUpdateParallel
-         pzopt.UpdateBatch.onLuaSuppressed(); // pzopt: entityUpdateParallel
+         pzopt.UpdateBatch.captureLuaEvent(event); // pzopt: entityUpdateLuaReplay -- captured on the worker, replayed in queue order on the game thread after the join (counted and dropped when the key is off)
          return; // pzopt: entityUpdateParallel
       } // pzopt: entityUpdateParallel
 
@@ -268,7 +270,7 @@ public final class LuaEventManager implements JavaFunction {
 
    public static void triggerEvent(String event, Object param1) {
       if (pzopt.UpdateBatch.onWorkerNow()) { // pzopt: entityUpdateParallel, see triggerEvent(String)
-         pzopt.UpdateBatch.onLuaSuppressed(); // pzopt: entityUpdateParallel
+         pzopt.UpdateBatch.captureLuaEvent(event, param1); // pzopt: entityUpdateLuaReplay -- captured on the worker, replayed in queue order on the game thread after the join (counted and dropped when the key is off)
          return; // pzopt: entityUpdateParallel
       } // pzopt: entityUpdateParallel
 
@@ -318,7 +320,7 @@ public final class LuaEventManager implements JavaFunction {
 
    public static void triggerEvent(String event, Object param1, Object param2) {
       if (pzopt.UpdateBatch.onWorkerNow()) { // pzopt: entityUpdateParallel, see triggerEvent(String)
-         pzopt.UpdateBatch.onLuaSuppressed(); // pzopt: entityUpdateParallel
+         pzopt.UpdateBatch.captureLuaEvent(event, param1, param2); // pzopt: entityUpdateLuaReplay -- captured on the worker, replayed in queue order on the game thread after the join (counted and dropped when the key is off)
          return; // pzopt: entityUpdateParallel
       } // pzopt: entityUpdateParallel
 
@@ -362,7 +364,7 @@ public final class LuaEventManager implements JavaFunction {
 
    public static void triggerEvent(String event, Object param1, Object param2, Object param3) {
       if (pzopt.UpdateBatch.onWorkerNow()) { // pzopt: entityUpdateParallel, see triggerEvent(String)
-         pzopt.UpdateBatch.onLuaSuppressed(); // pzopt: entityUpdateParallel
+         pzopt.UpdateBatch.captureLuaEvent(event, param1, param2, param3); // pzopt: entityUpdateLuaReplay -- captured on the worker, replayed in queue order on the game thread after the join (counted and dropped when the key is off)
          return; // pzopt: entityUpdateParallel
       } // pzopt: entityUpdateParallel
 
@@ -408,7 +410,7 @@ public final class LuaEventManager implements JavaFunction {
 
    public static void triggerEvent(String event, Object param1, Object param2, Object param3, Object param4) {
       if (pzopt.UpdateBatch.onWorkerNow()) { // pzopt: entityUpdateParallel, see triggerEvent(String)
-         pzopt.UpdateBatch.onLuaSuppressed(); // pzopt: entityUpdateParallel
+         pzopt.UpdateBatch.captureLuaEvent(event, param1, param2, param3, param4); // pzopt: entityUpdateLuaReplay -- captured on the worker, replayed in queue order on the game thread after the join (counted and dropped when the key is off)
          return; // pzopt: entityUpdateParallel
       } // pzopt: entityUpdateParallel
 
@@ -456,7 +458,7 @@ public final class LuaEventManager implements JavaFunction {
 
    public static void triggerEvent(String event, Object param1, Object param2, Object param3, Object param4, Object param5) {
       if (pzopt.UpdateBatch.onWorkerNow()) { // pzopt: entityUpdateParallel, see triggerEvent(String)
-         pzopt.UpdateBatch.onLuaSuppressed(); // pzopt: entityUpdateParallel
+         pzopt.UpdateBatch.captureLuaEvent(event, param1, param2, param3, param4, param5); // pzopt: entityUpdateLuaReplay -- captured on the worker, replayed in queue order on the game thread after the join (counted and dropped when the key is off)
          return; // pzopt: entityUpdateParallel
       } // pzopt: entityUpdateParallel
 
@@ -502,7 +504,7 @@ public final class LuaEventManager implements JavaFunction {
 
    public static void triggerEvent(String event, Object param1, Object param2, Object param3, Object param4, Object param5, Object param6) {
       if (pzopt.UpdateBatch.onWorkerNow()) { // pzopt: entityUpdateParallel, see triggerEvent(String)
-         pzopt.UpdateBatch.onLuaSuppressed(); // pzopt: entityUpdateParallel
+         pzopt.UpdateBatch.captureLuaEvent(event, param1, param2, param3, param4, param5, param6); // pzopt: entityUpdateLuaReplay -- captured on the worker, replayed in queue order on the game thread after the join (counted and dropped when the key is off)
          return; // pzopt: entityUpdateParallel
       } // pzopt: entityUpdateParallel
 
@@ -550,7 +552,7 @@ public final class LuaEventManager implements JavaFunction {
 
    public static void triggerEvent(String event, Object param1, Object param2, Object param3, Object param4, Object param5, Object param6, Object param7) {
       if (pzopt.UpdateBatch.onWorkerNow()) { // pzopt: entityUpdateParallel, see triggerEvent(String)
-         pzopt.UpdateBatch.onLuaSuppressed(); // pzopt: entityUpdateParallel
+         pzopt.UpdateBatch.captureLuaEvent(event, param1, param2, param3, param4, param5, param6, param7); // pzopt: entityUpdateLuaReplay -- captured on the worker, replayed in queue order on the game thread after the join (counted and dropped when the key is off)
          return; // pzopt: entityUpdateParallel
       } // pzopt: entityUpdateParallel
 
@@ -600,7 +602,7 @@ public final class LuaEventManager implements JavaFunction {
 
    public static void triggerEvent(String event, Object param1, Object param2, Object param3, Object param4, Object param5, Object param6, Object param7, Object param8) {
       if (pzopt.UpdateBatch.onWorkerNow()) { // pzopt: entityUpdateParallel, see triggerEvent(String)
-         pzopt.UpdateBatch.onLuaSuppressed(); // pzopt: entityUpdateParallel
+         pzopt.UpdateBatch.captureLuaEvent(event, param1, param2, param3, param4, param5, param6, param7, param8); // pzopt: entityUpdateLuaReplay -- captured on the worker, replayed in queue order on the game thread after the join (counted and dropped when the key is off)
          return; // pzopt: entityUpdateParallel
       } // pzopt: entityUpdateParallel
 

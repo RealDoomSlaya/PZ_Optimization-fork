@@ -110,7 +110,7 @@ public class LuaEventGuardTest {
                   first = inv;
                }
                if (inv.owner().name().stringValue().equals("pzopt/UpdateBatch")
-                     && inv.name().stringValue().equals("onLuaSuppressed")) {
+                     && inv.name().stringValue().equals("captureLuaEvent")) {
                   suppressed = true;
                }
             }
@@ -120,10 +120,21 @@ public class LuaEventGuardTest {
                      && first.name().stringValue().equals("onWorkerNow"),
                "triggerEvent" + sig + " begins with the onWorkerNow() guard, first call was "
                      + (first == null ? "none" : first.owner().name().stringValue() + "." + first.name().stringValue()));
-         Check.check(suppressed, "triggerEvent" + sig + " counts the suppression via onLuaSuppressed()");
+         Check.check(suppressed, "triggerEvent" + sig + " routes the worker dispatch to captureLuaEvent()"
+               + " (which captures for replay, or counts-and-drops when entityUpdateLuaReplay is off)");
       }
 
-      // ── runtime: a worker mid-batch is suppressed and counted, the game thread is untouched ──
+      // ── runtime needs drop mode: the probes fire all nine overloads on workers, and with replay on the
+      // fan-out would dispatch the seven env-unchecked overloads into the bare JVM's null Lua state. The
+      // default run pins the bytecode above (capture-mode runtime lives in LuaEventReplayTest) and then runs
+      // itself once more with the key off for the drop-mode runtime below.
+      if (Config.ENTITY_UPDATE_LUA_REPLAY) {
+         relaunchWithReplayOff();
+         System.out.println("LuaEventGuardTest ok");
+         return;
+      }
+
+      // ── runtime (drop mode): a worker mid-batch is suppressed and counted, the game thread is untouched ──
       Check.check(UpdateBatch.getLuaSuppressedCount() == 0, "no suppression before the batch");
 
       int n = 192;
@@ -177,6 +188,28 @@ public class LuaEventGuardTest {
             "describe() folds the suppression count in: " + UpdateBatch.describe());
 
       System.out.println("LuaEventGuardTest ok");
+   }
+
+   /** Run this same test in a subprocess with entityUpdateLuaReplay off, for the drop-mode runtime half. */
+   private static void relaunchWithReplayOff() throws Exception {
+      String javaBin = System.getProperty("java.home") + java.io.File.separator + "bin" + java.io.File.separator + "java";
+      java.util.List<String> cmd = new java.util.ArrayList<>();
+      cmd.add(javaBin);
+      cmd.add("-Dpzopt.dev=true");
+      cmd.add("-Dpzopt.entityUpdateLuaReplay=false");
+      String userOptions = System.getProperty("pzopt.userOptionsFile");
+      if (userOptions != null) {
+         cmd.add("-Dpzopt.userOptionsFile=" + userOptions);
+      }
+      cmd.add("-cp");
+      cmd.add(System.getProperty("java.class.path"));
+      cmd.add(LuaEventGuardTest.class.getName());
+
+      Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
+      String out = new String(p.getInputStream().readAllBytes());
+      int exit = p.waitFor();
+      Check.check(exit == 0 && out.contains("LuaEventGuardTest ok"),
+            "the drop-mode relaunch (entityUpdateLuaReplay=false) passed; exit=" + exit + " output:\n" + out);
    }
 
    private static Set<String> triggerEventOverloads(ClassModel model) {
