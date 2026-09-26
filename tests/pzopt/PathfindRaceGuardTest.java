@@ -20,12 +20,20 @@ import zombie.pathfind.PathFindBehavior2;
  * machine reads the list inside {@code update()}: the list shrinks between the size check and the {@code get},
  * or a torn position read collapses a direction to zero length. Two layers, like the patcher:
  * <ol>
- *   <li>on a worker, {@code update()} iterates a frozen clone of {@code this.path.nodes} taken once at entry
- *       (on the game thread the local aliases the live list, so serial behaviour is bit-identical);
- *   <li>a worker's {@code IndexOutOfBoundsException} / {@code IllegalStateException} out of the body returns
- *       {@code BehaviorResult.Working} and counts via {@code UpdateBatch.onPathfindRaceSkipped()} — the
- *       character just retries next frame. The game thread rethrows, vanilla parity.
+ *   <li>on a batch task — a worker OR the game thread working the batch ({@code onBatchTaskNow()}) —
+ *       {@code update()} iterates a frozen clone of {@code this.path.nodes} taken once at entry (outside a
+ *       batch the local aliases the live list, so serial behaviour is bit-identical);
+ *   <li>a batch task's {@code IndexOutOfBoundsException} / {@code IllegalStateException} out of the body
+ *       returns {@code BehaviorResult.Working} and counts via {@code UpdateBatch.onPathfindRaceSkipped()} —
+ *       the character just retries next frame. Outside a batch the throw escapes, vanilla parity.
  * </ol>
+ *
+ * <p>Both layers originally covered the workers only, keeping vanilla behaviour on the game-thread
+ * participant. The live runs said otherwise: every PathFindState escape of lou-replay-clean (4) and
+ * lou-fwd-scratch (1) bottomed out in {@code FrameBatch.run} — the game thread working the batch, where the
+ * concurrent writers (the pathfind thread's delivery, a group leader's member {@code pathToLocation} on
+ * another worker) are exactly as live as on a worker. {@code deferMovingSquare} already treated the
+ * participant as a batch task; the pathfind layers now match it.
  *
  * <p>The bytecode pin: the jar's {@code update()} reads the {@code Path.nodes} field many times; the built
  * override's reads it at most once (the entry snapshot) so no read in the body can see the live list. The
@@ -102,7 +110,7 @@ public class PathfindRaceGuardTest {
             "the override's update() reads Path.nodes at most once — the entry snapshot — so no read in the"
                   + " body can see the live list; found " + ourReads);
 
-      // ── game thread: the failure shape still throws (vanilla parity, key on or off) ──
+      // ── game thread OUTSIDE a batch: the failure shape still throws (vanilla parity, key on or off) ──
       Chr serial = new Chr();
       serial.getFinder().progress = AStarPathFinder.PathFindProgress.found;
       boolean threw = false;
@@ -111,11 +119,11 @@ public class PathfindRaceGuardTest {
       } catch (IndexOutOfBoundsException e) {
          threw = true;
       }
-      Check.check(threw, "on the game thread an out-of-range path read still throws, exactly like vanilla");
+      Check.check(threw, "outside a batch an out-of-range path read still throws, exactly like vanilla");
       Check.check(UpdateBatch.getPathfindRaceSkippedCount() == 0,
-            "the game-thread throw was not counted as a worker skip");
+            "the outside-batch throw was not counted as a skip");
 
-      // ── on a worker mid-batch: Working, counted, no throw ──
+      // ── on any batch task — worker or the game thread working the batch: Working, counted, no throw ──
       int n = 192;
       Probe[] probes = new Probe[n];
       for (int i = 0; i < n; i++) {
@@ -130,24 +138,22 @@ public class PathfindRaceGuardTest {
          Check.check(p.ran, "probe " + p.index + " ran");
          if (p.ranOnWorker) {
             onWorker++;
-            Check.check(p.thrown == null,
-                  "probe " + p.index + " on a worker: the race does not escape update(), threw " + p.thrown);
-            Check.check(p.result == PathFindBehavior2.BehaviorResult.Working,
-                  "probe " + p.index + " on a worker gets BehaviorResult.Working (retry next frame), got "
-                        + p.result);
          } else {
             onGameThread++;
-            Check.check(p.thrown != null,
-                  "probe " + p.index + " updated by the game thread mid-batch still gets vanilla's throw");
          }
+         Check.check(p.thrown == null,
+               "probe " + p.index + (p.ranOnWorker ? " on a worker" : " on the game thread mid-batch")
+                     + ": the race does not escape update(), threw " + p.thrown);
+         Check.check(p.result == PathFindBehavior2.BehaviorResult.Working,
+               "probe " + p.index + " gets BehaviorResult.Working (retry next frame), got " + p.result);
       }
       Check.check(onWorker > 0, "the batch put probes on the workers: " + onWorker);
       Check.check(onGameThread > 0, "the game thread worked the batch too: " + onGameThread);
       Check.check(!UpdateBatch.hasFailed(), "no probe leaked the race exception into the batch");
 
       long skipped = UpdateBatch.getPathfindRaceSkippedCount();
-      Check.check(skipped == onWorker,
-            "every worker skip was counted, exactly once each: " + onWorker + " worker probes, counted " + skipped);
+      Check.check(skipped == n,
+            "every batch task's skip was counted, exactly once each: " + n + " probes, counted " + skipped);
       Check.check(UpdateBatch.describe().contains("pathfindRaceSkipped=" + skipped),
             "describe() folds the skip count in: " + UpdateBatch.describe());
 

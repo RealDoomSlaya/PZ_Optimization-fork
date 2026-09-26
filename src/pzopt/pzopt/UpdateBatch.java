@@ -236,6 +236,18 @@ public final class UpdateBatch {
       return inFlight && Thread.currentThread() instanceof FrameBatch.Worker;
    }
 
+   /**
+    * True while this thread is running one of the batch's entity tasks — a worker OR the game thread working
+    * the batch. The pathfind guard's predicate: every PathFindState escape of the live runs (4 in
+    * lou-replay-clean, 1 in lou-fwd-scratch) was the game-thread participant reading the live path list while
+    * the pathfind thread or another worker's group-leader pathToLocation mutated it — mid-batch the participant
+    * faces the same writers a worker does, so it snapshots and skips like one. Outside a batch CURRENT is never
+    * set and vanilla behaviour is untouched (deferMovingSquare has used this same condition from the start).
+    */
+   public static boolean onBatchTaskNow() {
+      return inFlight && CURRENT.get() != null;
+   }
+
    public static long frames, batched, maxBatch, workNanos, waitNanos;
 
    /** True while a bucket should hand its scheduled entities over instead of walking them itself. */

@@ -778,11 +778,12 @@ implements IPathfinder {
 
     public BehaviorResult update() {
         // pzopt: entityUpdateParallel. Layer 1 of PZMulticore's PathFindBehavior2 port: PZ's async pathfinding
-        // writes this.path.nodes from its own thread while a frame worker runs this method, so on a worker the
-        // method iterates a frozen copy taken once here; every read below goes through this local. On the game
-        // thread the local IS the live list (no clone), so serial behaviour is bit-identical, key on or off.
+        // writes this.path.nodes from its own thread while a batch task runs this method, so on any batch task
+        // — a worker or the game thread working the batch (onBatchTaskNow; every live escape was the game-thread
+        // participant) — the method iterates a frozen copy taken once here; every read below goes through this
+        // local. Outside a batch the local IS the live list (no clone), so serial behaviour is bit-identical.
         ArrayList<PathNode> nodes = this.path.nodes; // pzopt: entityUpdateParallel, the method's only direct read
-        if (nodes != null && pzopt.UpdateBatch.onWorkerNow()) { // pzopt: entityUpdateParallel
+        if (nodes != null && pzopt.UpdateBatch.onBatchTaskNow()) { // pzopt: entityUpdateParallel
             nodes = (ArrayList<PathNode>)nodes.clone(); // pzopt: entityUpdateParallel
         } // pzopt: entityUpdateParallel
         try { // pzopt: entityUpdateParallel. Layer 2: the catch at the bottom of the method.
@@ -966,11 +967,11 @@ implements IPathfinder {
         // pzopt: entityUpdateParallel. Layer 2 of the PZMulticore port: the snapshot removes the list race, but a
         // torn position read can still surface as an IllegalStateException (a zero-length vector past the
         // ForwardDirection guard's own method) or an IndexOutOfBoundsException (pathIndex derived from the live
-        // path against the snapshot, or a list read inside a callee such as closestPointOnPath). On a worker the
-        // character just retries next frame: count it and report Working. The game thread rethrows — vanilla
-        // parity, key on or off.
+        // path against the snapshot, or a list read inside a callee such as closestPointOnPath). On any batch
+        // task — worker or game-thread participant, the same writers race both — the character just retries
+        // next frame: count it and report Working. Outside a batch the throw escapes — vanilla parity.
         } catch (IndexOutOfBoundsException | IllegalStateException e) { // pzopt: entityUpdateParallel
-            if (pzopt.UpdateBatch.onWorkerNow()) { // pzopt: entityUpdateParallel
+            if (pzopt.UpdateBatch.onBatchTaskNow()) { // pzopt: entityUpdateParallel
                 pzopt.UpdateBatch.onPathfindRaceSkipped(); // pzopt: entityUpdateParallel
                 return BehaviorResult.Working; // pzopt: entityUpdateParallel
             } // pzopt: entityUpdateParallel

@@ -4222,22 +4222,29 @@ FrameBatch worker) plus the first-failure stack trace and the one-line repeat.
 ### zombie.pathfind.PathFindBehavior2 (new override)
 
 - `update()`, both layers of PZMulticore's patcher at source level. Layer 1: `this.path.nodes` is read once at
-  entry into a local; on a worker mid-batch the local is a frozen `clone()` of the list, and every read in the
+  entry into a local; on a batch task the local is a frozen `clone()` of the list, and every read in the
   method body goes through the local — PZ's async pathfinding writes the live list from its own thread while the
-  method iterates. On the game thread the local IS the live list (no clone), so serial behaviour is bit-identical;
+  method iterates. Outside a batch the local IS the live list (no clone), so serial behaviour is bit-identical;
   the writes (`path.clear()`/`addNode` in the vehicle-target branch, `setPath2`, `closestPointOnPath`) stay against
   the live path exactly as the patcher left them. Layer 2: the body is wrapped in a catch of
-  `IndexOutOfBoundsException | IllegalStateException`; a worker counts it (`UpdateBatch.onPathfindRaceSkipped()`,
+  `IndexOutOfBoundsException | IllegalStateException`; a batch task counts it (`UpdateBatch.onPathfindRaceSkipped()`,
   AtomicLong, folded into `describe()`) and returns `BehaviorResult.Working` so the character retries next frame,
-  the game thread rethrows — vanilla parity where PZMulticore again caught unconditionally. Layer 2 stays necessary
+  outside a batch it rethrows — vanilla parity where PZMulticore again caught unconditionally. Layer 2 stays necessary
   behind layer 1 because the position race (layer 1 fixes only the list race) can still surface as a zero-length
   vector in a callee, and `pathIndex` is derived from the live path but indexes the snapshot. Key:
-  `entityUpdateParallel`. Also in this file, marked `pzopt: decompiler fix`: CFR's `(Object)` casts into
+  `entityUpdateParallel`. Both layers originally guarded on `onWorkerNow()` (workers only), keeping the game-thread
+  participant on vanilla's live-list read; the live runs disagreed — every PathFindState escape of lou-replay-clean
+  (4) and lou-fwd-scratch (1) bottomed out in `FrameBatch.run`, the game thread working the batch, racing the same
+  writers a worker does (the pathfind thread's delivery, a group leader's member `pathToLocation` on another
+  worker). The predicate is now `UpdateBatch.onBatchTaskNow()` (the batch in flight AND this thread inside one of
+  its entity tasks — the condition `deferMovingSquare` used from the start), so vanilla behaviour outside a batch
+  is untouched, key on or off. Also in this file, marked `pzopt: decompiler fix`: CFR's `(Object)` casts into
   `ObjectPool.release` and `set(Param<T>, T)`, and two locals whose declarations CFR dropped in
   `checkDoorHoppableWindow` — all verified against the jar by the bytecode audit (0 mismatches over the class's
   unedited methods). `tests/pzopt/PathfindRaceGuardTest` pins in bytecode that `update()` reads `Path.nodes` at most
   once (the jar's copy reads it many times), and drives the real `update()` on real characters through a real batch:
-  worker probes get Working plus the counter, game-thread probes still get vanilla's throw. The clone-under-race
+  every probe — worker or game-thread participant — gets Working plus the counter, and outside a batch the throw
+  still escapes exactly like vanilla. The clone-under-race
   semantics themselves (a list mutated mid-iteration surviving because the iteration holds a frozen copy) are not
   separately exercised at runtime — a bare JVM has no async pathfinder to race against; the bytecode pin plus the
   serial-aliasing argument above are the evidence.
