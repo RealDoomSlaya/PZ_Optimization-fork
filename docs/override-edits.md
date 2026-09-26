@@ -4053,3 +4053,191 @@ Default off. Unlike the postupdate batches, this one moves the simulation itself
 but their order within the frame is no longer the bucket's list order, so it is opt-in until the checksum rig has run
 over a route. `tests/pzopt/UpdateBatchTest` drives the batch with real `IsoMovingObject`s and pins the four-call
 sequence, once per entity, across threads, plus the failure latch.
+
+## The ItemVisuals scratch buffers a worker reaches, one per thread (`entityUpdateParallel`)
+
+`entityUpdateParallel` runs a simulation bucket's entities through their four update calls on the `FrameBatch` workers,
+so every static scratch object those calls reach stops being scratch and becomes shared mutable state. A live
+4,220-zombie batch proved it at frame 53: a `NullPointerException` out of the ShoeType sound parameter, on a worker,
+because the buffer it was walking by index had been cleared and refilled shorter by another worker part way through.
+The whole jar holds seven classes with a static `ItemVisuals` field; this pass fixes the two that a batched entity's
+`update()` can actually reach, and the reasoning for the other five is below so the next reader does not have to redo
+it.
+
+The shape of the bug is the same everywhere: `IsoGameCharacter.getItemVisuals(buffer)` **clears** the buffer and refills
+it from the caller's worn items, and the caller then reads it back by index. One buffer for every character is fine
+while one thread walks the entity list; two workers turn it into a torn read, and because the list only shrinks
+silently the symptom is either a null element (the crash above) or blood, dirt, holes and patches applied to the wrong
+character's clothing with no error at all.
+
+### zombie.characters.IsoGameCharacter
+
+A new `pzoptTempItemVisuals`, one `ItemVisuals` per thread, replaces the shared `tempItemVisuals` every character
+used, and each of the fourteen methods that filled that field takes its own thread's buffer into a local of the same
+name at the point where stock did the fill, so the rest of every method body is unchanged:
+`playWeaponHitArmourSound`, `addBasicPatch`, `addHole`, `addDirt`, `addLotsOfDirt`, `addBlood`, `bodyPartHasTag`,
+`getBodyPartClothingDefense`, `addHoleFromZombieAttacks`, `updateWornItemsVisionModifier`,
+`updateWornItemsHearingModifier`, `hasDirtyClothing`, `hasBloodyClothing` and `updateDisguisedState`. This is the class
+that matters: it is the base of every entity the bucket updates, and the path into it is plain single-player code — a
+zombie's `update()` runs `updateInternal`, that runs the state machine, the eat-body state splatters blood on the zombie
+itself, and `addBlood` hands the shared buffer on to the clothing-blood helper inside a loop of up to twenty-eight
+splats, the widest window of any of the fourteen. `getBodyPartClothingDefense` is reached from the same `update()` by a
+second, independent route (the falling / landing / fell-on-knees chain).
+
+The jar's field itself stays declared, with its name, type and `protected static final` access, because
+`scripts/build.sh` requires every non-private member of a shadowed class to survive so anything compiled against the
+shipped class still links; nothing reads it any more. Since the locals shadow it, a method that missed its local would
+compile and quietly go back to sharing, so the test below checks the built class files: no method of either class may
+touch that field, the initializer that creates it aside.
+
+Every one of the fourteen is pure per-call scratch — filled, read inside the one call, nothing carried between calls —
+so one buffer per thread is exactly what the game thread already had: a single buffer, reused. There is therefore no
+behaviour to protect and the change is unconditional rather than gated on the key. A guard would have had to be
+repeated at all fourteen sites, would have kept the shared buffer in live use on one branch of each of them, and would
+have given the bytecode check above nothing to assert: more surface for no gain.
+
+### zombie.characters.IsoZombie
+
+`helmetFallFromVisuals` was the only user of that field outside `IsoGameCharacter` anywhere in the jar, so it reads its
+own thread's buffer now. Its own behaviour is unchanged (it still removes a fallen entry from the buffer and copies the
+rest into the zombie's visuals); it is reached from combat rather than from `update()`, and it follows only because the
+field it read has moved.
+
+### zombie.audio.parameters.ParameterShoeType (new override)
+
+The class that produced the crash. It keeps its own static `ItemVisuals`, filled by `getShoeType` from the character's
+worn items and then walked by index looking for the SHOES body location; that walk re-reads the size each iteration, so
+a refill by another worker between the size check and the element read hands back a null and the parameter update dies.
+Same treatment, same reasoning: per-thread buffer, fetched into a local in `getShoeType`, unconditional. The path is the
+sound upkeep every zombie does on every update — `updateInternal`, `updateEmitter`, the FMOD parameter list, this
+parameter's `calculateCurrentValue` — which is why it was the one that showed up first, and within a minute of the first
+parallel run.
+
+### Checked and deliberately left alone
+
+`zombie.characters.ClothingWetness` (a static `ItemVisuals` plus a static covered-parts list) and
+`zombie.characters.BodyDamage.Thermoregulator` (two static `ItemVisuals` plus a static covered-parts list) carry the
+same hazard in principle but cannot be reached from a worker as the batch stands: a `ClothingWetness` is only ever
+constructed by `IsoPlayer`, a `Thermoregulator` only when the body damage's owner is an `IsoPlayer`, and the body damage
+object itself is only created for players and animals — so the whole `BodyDamage.Update` subtree is dead for anything
+else, and `UpdateBatch.batchableType` keeps players and animals on the game thread anyway. Shadowing two more game
+classes for a path nothing can take would add two permanent decompile-and-audit liabilities against the top requirement
+of this repo, and the thermoregulator is dense float physics — the worst candidate there is for a hand-fixed decompile.
+Worth noting for whoever lets animals into the batch: that is the moment these two become live, and one of the
+thermoregulator's two buffers is **not** per-call scratch. It is a cache of the previous call's visuals, compared
+against the fresh list to decide whether to rebuild the per-node clothing lists, so a thread-local there is not
+behaviour-identical — it turns cache hits into misses. Harmless in effect (a miss only redoes a deterministic rebuild)
+and close to academic, since one static cache shared by every character already misses nearly always in a world with
+more than one of them, but it has to be a deliberate decision rather than a mechanical one.
+
+`zombie.PersistentOutfits`'s buffer is used only by the fallen-hat removal, which the outfit-dressing path reaches: from
+multiplayer packet handling, from zombie spawning, and from the render-side random-outfit dressing. The one route from
+`update()` is behind `Core.debug` and goes through the model manager's dressing, which is far more than a buffer's worth
+of not-worker-safe work; the key is off in multiplayer in any case.
+`zombie.network.packets.ZombieHelmetFallingPacket` is multiplayer only, and `UpdateBatch.enabled()` is false there.
+`zombie.characters.BodyDamage.Thermoregulator_tryouts` is dead code — nothing in the jar references it but its own
+nested classes.
+
+Not in this pass, and a bigger job: `IsoGameCharacter` holds a dozen more static scratch objects of other types
+(`tempo`, `tempo2`, `tempo3`, `tempVector2`, `tempVector2_1`, `tempVector2_2`, `tempVector3f00`, `tempVector3f01`,
+`tempVectorBonePos`, `inf`, `movingStatic`, the bandages singleton). Those are the same class of hazard for
+`entityUpdateParallel` and want the same audit before the key is turned on by default.
+
+`tests/pzopt/ItemVisualsScratchTest` drives both fixed paths for real — `hasDirtyClothing` on a real
+`IsoGameCharacter`, and the ShoeType parameter's `calculateCurrentValue` — from eight threads held on a barrier inside
+`getItemVisuals` so every thread has filled its buffer before any of them reads it back, and asserts each thread had a
+buffer of its own still holding what it wrote, and that two calls on one thread reuse that thread's buffer instead of
+allocating per call. Two pins come with it, both read straight out of class files: that the jar still declares both
+fields as `static ItemVisuals`, so a change at The Indie Stone's end fails the build instead of quietly making the
+override pointless, and that the built overrides no longer reach the retained shared field. Against the stock classes
+the concurrency check reports "1 of 8 were distinct" for each path.
+
+## The worker guards ported from PZMulticore (`entityUpdateParallel`)
+
+The live 4,220-zombie runs of the entity batch showed the next two races past the ItemVisuals scratch pass: an
+`IllegalStateException: Forward Direction cannot be zero length vector` out of `WalkTowardState.execute` on a
+`pzopt-frame-` worker, and an `ArrayIndexOutOfBoundsException: Index -1 out of bounds for length 2` at frame 10 that
+arrived with no stack at all, because the batch logged only the throwable's `toString()`. This pass ports PZMulticore's
+proven guard set for exactly these races (its ASM patchers ForwardDirection, LuaEventManager, AttachedItems and
+PathFindBehavior2, months in live use) into pzopt's idiom — source edits in the overrides, logic in `pzopt.UpdateBatch`
+— with one deliberate difference throughout: where PZMulticore patched unconditionally, every pzopt guard keys on
+`UpdateBatch.onWorkerNow()`, so the game-thread path stays byte-identical to vanilla with the key off *and* on.
+
+`onWorkerNow()` is the one predicate all of them share: true only while the entity batch is actually in flight (a
+volatile set and cleared around the batch's `FrameBatch.run` inside `UpdateBatch.run`) AND the current thread is a
+`FrameBatch.Worker` (an instanceof check — the worker class is public, so no name-prefix matching). Both conditions
+carry weight. The in-flight flag keeps the scheduler's other batches, which share the same workers but never call Lua
+or the guarded paths by design (AnimBatch, ActionEval, LightingBatch, SeparateBatch), entirely unaffected; FrameBatch
+runs one batch at a time, so while the flag is up the only tasks on the workers are this batch's entities. The thread
+check keeps the game thread — which works the batch alongside the workers — on vanilla behaviour for every entity it
+updates itself. `UpdateBatch.run` also logs the FIRST failure's full stack trace now (one-shot; repeats keep the
+one-line summary), so the next unknown race arrives with a call site instead of a bare `toString()`.
+
+`tests/pzopt/WorkerNowTest` pins the predicate from all three sides (game thread, entity-batch worker, plain
+FrameBatch worker) plus the first-failure stack trace and the one-line repeat.
+
+### zombie.characters.IsoGameCharacter (existing override)
+
+- `setForwardDirection(float, float)`: vanilla writes the direction, normalizes, sets the iso direction and THEN
+  throws `IllegalStateException` when the length is zero. On a worker mid-batch the zero length is a torn position
+  read (two threads read/write positions during the parallel update and a walk delta collapses), not a programming
+  error, so the method now returns silently there — the character keeps its previous direction and the next frame
+  recomputes. Vanilla's mutation order is untouched (PZMulticore's patch replaced the ATHROW with a POP+RETURN, i.e.
+  kept the same writes); the game thread still throws, key on or off, which is where pzopt deliberately narrows
+  PZMulticore's unconditional patch. Key: `entityUpdateParallel`. `tests/pzopt/ForwardDirectionGuardTest` pins both
+  sides on real characters driven through a real batch.
+
+### zombie.Lua.LuaEventManager (new override)
+
+- every `triggerEvent` overload (nine of them): at entry, if `UpdateBatch.onWorkerNow()`, count via
+  `UpdateBatch.onLuaSuppressed()` and return. Vanilla's main-thread path writes the shared static argument slots
+  `a1..a8`/`a1index..a8index`; its off-thread path takes the `EventMap` monitor and queues into a shared pool — a
+  worker mid-batch must enter neither, and a mod's event handler running against a half-updated entity is wrong even
+  where it would not crash. `onLuaSuppressed()` is an AtomicLong with a one-shot stack dump on the first occurrence
+  (so the log says which event from where), `getLuaSuppressedCount()` reads it and `UpdateBatch.describe()` folds it
+  into the console summary line. The game thread dispatches exactly as vanilla, so nothing a player does with the key
+  off changes. KahluaThread (`pcall`) is deliberately NOT guarded in this pass: `LuaEventManager.triggerEvent` is the
+  single funnel for event dispatch out of entity code, and the pcall-level belt goes in only if evidence shows a path
+  that bypasses it. Key: `entityUpdateParallel`. `tests/pzopt/LuaEventGuardTest` exercises worker suppression for all
+  nine overloads and game-thread dispatch through a real batch, and pins in bytecode that the override carries
+  exactly the jar's overload set with the guard as each one's first call; runtime dispatch into a real Lua state is
+  not exercised (no Kahlua environment in a bare JVM).
+
+### zombie.characters.AttachedItems.AttachedItems (new override)
+
+- all thirteen public methods are `synchronized` — the patcher's exact set: constructors and the two private
+  `indexOf` helpers skipped (the privates only run from the synchronized publics, so they already hold the lock).
+  The class is a plain `ArrayList<AttachedItem>` behind get/setItem/remove/forEach; every read re-checks `size()`
+  against a list another thread may be shrinking, and PZMulticore traced the resulting `IndexOutOfBoundsException`
+  out of `ArrayList` to exactly this class under its parallel updates. This is also the most plausible culprit for
+  our own frame-10 `Index -1 out of bounds for length 2`. One lock per character's instance, so contention needs two
+  threads on the SAME character, which the bucket scheduler prevents — on the game thread the cost is an
+  uncontended lock. This edit is intentionally not keyed on `onWorkerNow()`: ACC_SYNCHRONIZED on an uncontended
+  monitor does not change what any method computes, and a conditional lock cannot be expressed with the flag while
+  the unconditional one is exactly what months of PZMulticore live use ran. Key (reached only via):
+  `entityUpdateParallel`. `tests/pzopt/AttachedItemsSyncTest` shows the stock class tearing within two seconds
+  (ArrayList's IOOBE out of `forEach` against `copyFrom`/`clear`) and the override clean, and pins ACC_SYNCHRONIZED
+  on exactly the jar's public method set in the built class.
+
+### zombie.pathfind.PathFindBehavior2 (new override)
+
+- `update()`, both layers of PZMulticore's patcher at source level. Layer 1: `this.path.nodes` is read once at
+  entry into a local; on a worker mid-batch the local is a frozen `clone()` of the list, and every read in the
+  method body goes through the local — PZ's async pathfinding writes the live list from its own thread while the
+  method iterates. On the game thread the local IS the live list (no clone), so serial behaviour is bit-identical;
+  the writes (`path.clear()`/`addNode` in the vehicle-target branch, `setPath2`, `closestPointOnPath`) stay against
+  the live path exactly as the patcher left them. Layer 2: the body is wrapped in a catch of
+  `IndexOutOfBoundsException | IllegalStateException`; a worker counts it (`UpdateBatch.onPathfindRaceSkipped()`,
+  AtomicLong, folded into `describe()`) and returns `BehaviorResult.Working` so the character retries next frame,
+  the game thread rethrows — vanilla parity where PZMulticore again caught unconditionally. Layer 2 stays necessary
+  behind layer 1 because the position race (layer 1 fixes only the list race) can still surface as a zero-length
+  vector in a callee, and `pathIndex` is derived from the live path but indexes the snapshot. Key:
+  `entityUpdateParallel`. Also in this file, marked `pzopt: decompiler fix`: CFR's `(Object)` casts into
+  `ObjectPool.release` and `set(Param<T>, T)`, and two locals whose declarations CFR dropped in
+  `checkDoorHoppableWindow` — all verified against the jar by the bytecode audit (0 mismatches over the class's
+  unedited methods). `tests/pzopt/PathfindRaceGuardTest` pins in bytecode that `update()` reads `Path.nodes` at most
+  once (the jar's copy reads it many times), and drives the real `update()` on real characters through a real batch:
+  worker probes get Working plus the counter, game-thread probes still get vanilla's throw. The clone-under-race
+  semantics themselves (a list mutated mid-iteration surviving because the iteration holds a frozen copy) are not
+  separately exercised at runtime — a bare JVM has no async pathfinder to race against; the bytecode pin plus the
+  serial-aliasing argument above are the evidence.

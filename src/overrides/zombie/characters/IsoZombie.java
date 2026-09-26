@@ -6116,6 +6116,9 @@ public final class IsoZombie extends IsoGameCharacter implements IHumanVisual {
 
    public boolean helmetFallFromVisuals(boolean hitHead) {
       boolean removed = false;
+      // pzopt: entityUpdateParallel. The only user of IsoGameCharacter's shared static scratch buffer outside that
+      // class; it is one ItemVisuals per thread there now (pzoptTempItemVisuals), so this reads its own.
+      ItemVisuals tempItemVisuals = pzoptTempItemVisuals.get(); // pzopt: entityUpdateParallel
       this.getItemVisuals(tempItemVisuals);
 
       for (int i = 0; i < tempItemVisuals.size(); i++) {

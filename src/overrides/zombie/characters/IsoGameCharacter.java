@@ -385,7 +385,20 @@ public abstract class IsoGameCharacter
    private static final float ZombieNearbyClimbPenalty = 7.0F;
    public static final int GlovesStrengthBonus = 1;
    public static final int AwkwardGlovesStrengthDivisor = 2;
+   // pzopt: entityUpdateParallel. Nothing reads this any more — the jar's own users of it are this class and
+   // IsoZombie.helmetFallFromVisuals, both of which take pzoptTempItemVisuals below instead. It is left declared,
+   // with the jar's name, type and access, only so anything compiled against the shipped class still links
+   // (scripts/build.sh's signature check enforces that for every non-private member). Do not use it: it is the
+   // shared buffer the per-thread one replaces.
    protected static final ItemVisuals tempItemVisuals = new ItemVisuals();
+   // pzopt: entityUpdateParallel. One ItemVisuals shared by every character is a data race as soon as two
+   // frame workers run two entities' update(): getItemVisuals(buffer) clears the buffer and refills it from the
+   // caller's worn items, so one worker shortens the list another worker is part way through walking by index
+   // (a 4,220-zombie batch died on ParameterShoeType's copy of the same pattern at frame 53). One buffer per
+   // thread: the game thread still sees a single buffer reused across calls, exactly as the static gave it, so
+   // this is unconditional rather than behind the key. Every user below fills it and reads it inside the one
+   // call and nothing carries over between calls, so per-thread is behaviour-identical on one thread.
+   protected static final ThreadLocal<ItemVisuals> pzoptTempItemVisuals = ThreadLocal.withInitial(ItemVisuals::new);
    public static final float HUMANOID_WORLD_CHEST_HEIGHT = 0.495F;
    public static final float HUMANOID_SCREEN_CHEST_HEIGHT = 20.0F;
    private final float extraLungeRange = 0.2F;
@@ -2899,6 +2912,14 @@ public abstract class IsoGameCharacter
       float forwardDirectionLength = this.forwardDirection.normalize();
       super.setForwardIsoDirection(IsoDirections.fromAngle(directionX, directionY));
       if (PZMath.equal(forwardDirectionLength, 0.0F)) {
+         // pzopt: entityUpdateParallel. On a frame worker a zero-length direction is a torn position read
+         // (WalkTowardState's delta collapses when another thread moves the target between the two reads), not a
+         // programming error: keep the previous direction and let the next frame recompute, instead of one throw
+         // latching the whole batch off. Vanilla's writes above already happened, exactly as they do on the
+         // vanilla throw path; the game thread still throws, key on or off.
+         if (pzopt.UpdateBatch.onWorkerNow()) { // pzopt: entityUpdateParallel
+            return; // pzopt: entityUpdateParallel
+         } // pzopt: entityUpdateParallel
          throw new IllegalStateException("Forward Direction cannot be zero length vector.");
       }
    }
@@ -11800,6 +11821,7 @@ public abstract class IsoGameCharacter
    }
 
    public long playWeaponHitArmourSound(int partIndex, boolean bullet) {
+      ItemVisuals tempItemVisuals = pzoptTempItemVisuals.get(); // pzopt: entityUpdateParallel
       this.getItemVisuals(tempItemVisuals);
 
       for (int i = tempItemVisuals.size() - 1; i >= 0; i--) {
@@ -12959,6 +12981,7 @@ public abstract class IsoGameCharacter
          }
 
          HumanVisual humanVisual = ((IHumanVisual)this).getHumanVisual();
+         ItemVisuals tempItemVisuals = pzoptTempItemVisuals.get(); // pzopt: entityUpdateParallel
          this.getItemVisuals(tempItemVisuals);
          BloodClothingType.addBasicPatch(part, humanVisual, tempItemVisuals);
          this.updateModelTextures = true;
@@ -12983,6 +13006,7 @@ public abstract class IsoGameCharacter
       }
 
       HumanVisual humanVisual = ((IHumanVisual)this).getHumanVisual();
+      ItemVisuals tempItemVisuals = pzoptTempItemVisuals.get(); // pzopt: entityUpdateParallel
       this.getItemVisuals(tempItemVisuals);
       boolean addedHole = BloodClothingType.addHole(part, humanVisual, tempItemVisuals, allLayers);
       this.updateModelTextures = true;
@@ -13005,6 +13029,7 @@ public abstract class IsoGameCharacter
             randomPart = true;
          }
 
+         ItemVisuals tempItemVisuals = pzoptTempItemVisuals.get(); // pzopt: entityUpdateParallel
          this.getItemVisuals(tempItemVisuals);
 
          for (int i = 0; i < nbr; i++) {
@@ -13034,6 +13059,7 @@ public abstract class IsoGameCharacter
             randomPart = true;
          }
 
+         ItemVisuals tempItemVisuals = pzoptTempItemVisuals.get(); // pzopt: entityUpdateParallel
          this.getItemVisuals(tempItemVisuals);
 
          for (int i = 0; i < nbr; i++) {
@@ -13079,6 +13105,7 @@ public abstract class IsoGameCharacter
             nbr += 8;
          }
 
+         ItemVisuals tempItemVisuals = pzoptTempItemVisuals.get(); // pzopt: entityUpdateParallel
          this.getItemVisuals(tempItemVisuals);
 
          for (int i = 0; i < nbr; i++) {
@@ -13102,6 +13129,7 @@ public abstract class IsoGameCharacter
    }
 
    private boolean bodyPartHasTag(Integer part, ItemTag itemTag) {
+      ItemVisuals tempItemVisuals = pzoptTempItemVisuals.get(); // pzopt: entityUpdateParallel
       this.getItemVisuals(tempItemVisuals);
 
       for (int i = tempItemVisuals.size() - 1; i >= 0; i--) {
@@ -13146,6 +13174,7 @@ public abstract class IsoGameCharacter
 
    public float getBodyPartClothingDefense(Integer part, boolean bite, boolean bullet) {
       float result = 0.0F;
+      ItemVisuals tempItemVisuals = pzoptTempItemVisuals.get(); // pzopt: entityUpdateParallel
       this.getItemVisuals(tempItemVisuals);
 
       for (int i = tempItemVisuals.size() - 1; i >= 0; i--) {
@@ -13878,6 +13907,7 @@ public abstract class IsoGameCharacter
    }
 
    public boolean addHoleFromZombieAttacks(BloodBodyPartType part, boolean scratch) {
+      ItemVisuals tempItemVisuals = pzoptTempItemVisuals.get(); // pzopt: entityUpdateParallel
       this.getItemVisuals(tempItemVisuals);
       ItemVisual itemHit = null;
 
@@ -15031,6 +15061,7 @@ public abstract class IsoGameCharacter
    public void updateWornItemsVisionModifier() {
       float mod = 1.0F;
       if (this instanceof IsoZombie) {
+         ItemVisuals tempItemVisuals = pzoptTempItemVisuals.get(); // pzopt: entityUpdateParallel
          this.getItemVisuals(tempItemVisuals);
          if (tempItemVisuals != null) {
             for (int i = tempItemVisuals.size() - 1; i >= 0; i--) {
@@ -15066,6 +15097,7 @@ public abstract class IsoGameCharacter
    public void updateWornItemsHearingModifier() {
       float mod = 1.0F;
       if (this instanceof IsoZombie) {
+         ItemVisuals tempItemVisuals = pzoptTempItemVisuals.get(); // pzopt: entityUpdateParallel
          this.getItemVisuals(tempItemVisuals);
 
          for (int i = tempItemVisuals.size() - 1; i >= 0; i--) {
@@ -15144,6 +15176,7 @@ public abstract class IsoGameCharacter
    }
 
    public boolean hasDirtyClothing(Integer part) {
+      ItemVisuals tempItemVisuals = pzoptTempItemVisuals.get(); // pzopt: entityUpdateParallel
       this.getItemVisuals(tempItemVisuals);
 
       for (int i = tempItemVisuals.size() - 1; i >= 0; i--) {
@@ -15176,6 +15209,7 @@ public abstract class IsoGameCharacter
    }
 
    public boolean hasBloodyClothing(Integer part) {
+      ItemVisuals tempItemVisuals = pzoptTempItemVisuals.get(); // pzopt: entityUpdateParallel
       this.getItemVisuals(tempItemVisuals);
 
       for (int i = tempItemVisuals.size() - 1; i >= 0; i--) {
@@ -15337,6 +15371,7 @@ public abstract class IsoGameCharacter
          SafeHouse safe = SafeHouse.isSafeHouse(this.getCurrentSquare(), null, false);
          if (safe == null || !ServerOptions.instance.safehouseDisableDisguises.getValue() || player.role.hasCapability(Capability.CanGoInsideSafehouses)) {
             HashSet<ItemTag> testItemTags = new HashSet<>();
+            ItemVisuals tempItemVisuals = pzoptTempItemVisuals.get(); // pzopt: entityUpdateParallel
             this.getItemVisuals(tempItemVisuals);
             if (tempItemVisuals != null) {
                for (int i = tempItemVisuals.size() - 1; i >= 0; i--) {
