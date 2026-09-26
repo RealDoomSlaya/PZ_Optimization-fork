@@ -4395,3 +4395,16 @@ against the vanilla step sequence and, in bytecode, that the jar's `updateLOS` h
 override's still calls `spotted` and routes the skip accounting through `AnimalLos.decay`; a runtime drive
 needs a constructible IsoAnimal with a populated cell, which a bare JVM does not have (the constructor
 chain pulls AnimalDefinitions through the script engine).
+
+## entityUpdateParallel: vehicles and physics objects stay inline (batchableType)
+
+Found by the first hour-long live session (2026-09-26), not by any bench: the Louisville route is on foot,
+so no active vehicle ever updated mid-batch until real play did it. `UpdateBatch.batchableType` excluded
+players and animals but admitted `BaseVehicle` — an active vehicle's `update()` reaches Lua part scripts
+(`updateParts` → `VehicleParts.callLuaVoid` → `KahluaThread.pcall`), the wrong-thread guard errored 26
+times on `pzopt-frame-*` workers, and the 27th corrupted the Kahlua VM stack ("Index -4 out of bounds for
+length 1000"), latching batching off for the session. `batchableType` now also excludes `BaseVehicle`
+(Lua + pzBullet) and `IsoPhysicsObject` (native physics, never audited); both update inline on the game
+thread exactly as with the key off. The same session was otherwise the branch's strongest evidence: ~17,900
+frames of real play with zero caught state exceptions before the vehicle moment. `UpdateBatchTest` pins the
+four exclusions and the zombie/probe admissions.

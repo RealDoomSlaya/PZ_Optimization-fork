@@ -142,6 +142,14 @@ public class UpdateBatchTest {
       Check.check(UpdateBatch.batchableType(zombie.characters.IsoZombie.class),
             "a zombie is the case this batch exists for");
       Check.check(UpdateBatch.batchableType(Probe.class), "a plain moving object is batchable");
+      // Found by the first hour-long live session (2026-09-26): a vehicle updated on pzopt-frame-2 —
+      // BaseVehicle.update > updateParts > VehicleParts.callLuaVoid reaches Lua part scripts (the wrong-thread
+      // guard errored 26 times, then the Kahlua VM stack corrupted: "Index -4 out of bounds for length 1000",
+      // batching off). The bench route is on foot, so no active vehicle ever updated mid-batch until real play.
+      Check.check(!UpdateBatch.batchableType(zombie.vehicles.BaseVehicle.class),
+            "a vehicle never runs on a worker: its part updates reach Lua and pzBullet");
+      Check.check(!UpdateBatch.batchableType(zombie.iso.IsoPhysicsObject.class),
+            "a physics object never runs on a worker: its update steps native physics, never audited");
 
       // ── one entity throwing does not stop the others, and turns batching off for the session ──
       Check.check(!UpdateBatch.hasFailed(), "the batch has not failed yet");

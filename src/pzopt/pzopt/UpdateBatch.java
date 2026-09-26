@@ -262,9 +262,18 @@ public final class UpdateBatch {
     * {@code OnPlayer*} events), nothing here guards against Lua re-entry from a worker, and the scheduler puts
     * every player in the FULL bucket, so a batch that did not exclude them would hand them to a worker on the
     * first frame. Animals follow the same rule as in ActionEval rather than being assumed safe.
+    *
+    * <p>Vehicles and physics objects stay inline too, found by the first hour-long live session (2026-09-26):
+    * an active vehicle's {@code update()} reaches Lua part scripts ({@code updateParts} →
+    * {@code VehicleParts.callLuaVoid}) — the wrong-thread guard errored 26 times on the workers and the 27th
+    * corrupted the Kahlua VM stack ("Index -4 out of bounds for length 1000"), latching batching off. The bench
+    * route is on foot, so no active vehicle ever updated mid-batch before real play did it. IsoPhysicsObject
+    * steps native physics and was never audited — same rule.
     */
    public static boolean batchableType(Class<?> type) {
-      return !IsoPlayer.class.isAssignableFrom(type) && !IsoAnimal.class.isAssignableFrom(type);
+      return !IsoPlayer.class.isAssignableFrom(type) && !IsoAnimal.class.isAssignableFrom(type)
+            && !zombie.vehicles.BaseVehicle.class.isAssignableFrom(type)
+            && !zombie.iso.IsoPhysicsObject.class.isAssignableFrom(type);
    }
 
    /** Whether this entity may update on a worker: its type, plus the per-zombie cases that read another entity. */
