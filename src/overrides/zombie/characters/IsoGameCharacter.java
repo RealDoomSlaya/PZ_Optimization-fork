@@ -4954,8 +4954,9 @@ public abstract class IsoGameCharacter
    }
 
    public void setForwardDirectionFromIsoDirection() {
-      this.getVectorFromDirection(tempVector2_2);
-      this.setForwardDirection(tempVector2_2);
+      Vector2 scratch = pzopt.UpdateBatch.dirScratch(); // pzopt: entityUpdateParallel — the static tempVector2_2 is shared by every character on every thread, and getVectorFromDirection zeroes it before assigning, so batched zombies read each other's mid-write (0,0) here and threw "Forward Direction cannot be zero length vector" (the WalkToward/Thump/ClimbOverFence residue); per-thread scratch, identical output single-threaded
+      this.getVectorFromDirection(scratch); // pzopt: entityUpdateParallel
+      this.setForwardDirection(scratch); // pzopt: entityUpdateParallel
    }
 
    public void setForwardDirectionFromAnimAngle() {

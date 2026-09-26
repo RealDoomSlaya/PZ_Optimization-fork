@@ -55,6 +55,20 @@ public final class UpdateBatch {
    private static volatile long snapshotFrame;
    private static final ThreadLocal<IsoMovingObject> CURRENT = new ThreadLocal<>();
 
+   // setForwardDirectionFromIsoDirection's scratch vector. The jar's method writes the direction into the STATIC
+   // IsoGameCharacter.tempVector2_2 and reads it back, and getVectorFromDirection ZEROES the vector before the
+   // switch assigns it — so with zombies on the workers, any character reading between another's zeroing and its
+   // assignment got an exact (0,0) and threw "Forward Direction cannot be zero length vector" (the whole
+   // 37-exception Louisville residue: WalkTowardState, ThumpState, ClimbOverFenceState — the last from
+   // setDir(IsoDirections.N), a constant, which is what ruled the states' own math out). Between throws the same
+   // race silently handed a walker another zombie's direction. Per-thread vector, same idiom as VehicleCull.near.
+   private static final ThreadLocal<zombie.iso.Vector2> DIR_SCRATCH = ThreadLocal.withInitial(zombie.iso.Vector2::new);
+
+   /** This thread's direction scratch vector, for the IsoGameCharacter override. */
+   public static zombie.iso.Vector2 dirScratch() {
+      return DIR_SCRATCH.get();
+   }
+
    /**
     * True when this entity's position must be read from the snapshot: a batch is in flight, the entity is in it
     * (its stamp matches this batch), and the caller is not the task updating it. Called by the IsoMovingObject

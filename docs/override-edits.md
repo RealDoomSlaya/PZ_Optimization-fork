@@ -4337,3 +4337,24 @@ PathFindBehavior2 clone the evidence is structural plus the live run: `tests/pzo
 in bytecode that the jar's methods hold no monitor (the lock is ours, and a TIS-added lock would be noticed)
 and that exactly `update`/`findNearestGroup`/`preupdate`/`Reset` in the override each hold one, with the
 method set otherwise identical to the jar's.
+
+## zombie.characters.IsoGameCharacter: setForwardDirectionFromIsoDirection off the static scratch (`entityUpdateParallel`)
+
+The residue of every batched Louisville run — 37 caught exceptions over 3,064 zombies (1.21% per zombie),
+unchanged by the position-snapshot AND the Lua-replay layers — was `IllegalStateException: Forward Direction
+cannot be zero length vector` out of WalkTowardState (27), ThumpState (5) and ClimbOverFenceState (1).
+ClimbOverFenceState throws it from `setDir(IsoDirections.N)`, a constant, which rules the states' own math
+out; all 33 stacks route through `setForwardDirectionFromIsoDirection`. Its jar body is four instructions:
+write the character's direction into the STATIC `tempVector2_2` with `getVectorFromDirection`, read it back
+into `setForwardDirection`. One scratch Vector2 shared by every character on every thread — and
+`getVectorFromDirection` zeroes the vector before its switch assigns the direction, so a batched zombie
+reading between another worker's zeroing and its assignment sees an exact (0,0) and throws. Between throws
+the same race silently hands a walker another zombie's direction for a frame.
+
+The method now takes its vector from `pzopt.UpdateBatch.dirScratch()`, a per-thread Vector2
+(`ThreadLocal.withInitial`, the `VehicleCull.near` idiom). Identical output single-threaded; the other
+`tempVector2_2` users (`processHitDamage`, `renderlast`, `isObjectBehind`, `isBehind`) keep the static and
+are the static-scratch audit's follow-up. `tests/pzopt/ForwardDirectionScratchTest` pins that the jar's
+method still uses the static (a TIS rework would be noticed), that the override's method touches no
+`tempVector2_2` and routes through `dirScratch()`, and that the scratch is per-thread; a runtime hammer
+needs a constructible IsoGameCharacter, which a bare JVM does not have.
