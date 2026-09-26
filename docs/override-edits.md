@@ -4020,3 +4020,36 @@ direct-sun share and the wall fixes in `pzopt.ChunkAo`'s kernel.
 ### zombie.iso.weather.fx.WeatherFxMask
 - The stock screen-space cloud layer is skipped (and does not keep the weather mask awake) while
   `CloudShadow.replaceStock` (`cloudReplaceStock`, off by default).
+
+## zombie.MovingObjectUpdateSchedulerUpdateBucket: the bucket's update loop on the workers (`entityUpdateParallel`, new override)
+
+The three batches that already ride the scheduler all sit *around* the simulation: `SeparateBatch` computes the
+separations before the update loop, `ActionEval` and `AnimBatch` take the transition evaluation and the bone math out of
+the postupdate loop. The loop in the middle — the entities' own `update()` — was still one after another on the game
+thread, and it is the only part of the frame that scales with the whole moving-object population rather than with the
+zombies alone: animals, vehicles and the players go through the same bucket.
+
+The bucket is a new override (it is a top-level class, so shadowing `MovingObjectUpdateScheduler` never covered it). In
+`update(int)` the loop now walks the bucket's sub-list in stock's order and, with the key on, hands each eligible entity
+to `pzopt.UpdateBatch` instead of updating it inline; after the loop the batch runs the same four calls per entity —
+`setCurrentSimulationLevel`, `preupdate`, `frameStep`, `update`, in that order — on the `FrameBatch` workers. Four calls,
+not one: stock does all four per entity and losing any of them is silent, so the batch reproduces the sequence rather
+than just the `update()`.
+
+Two cases stay on the game thread, collected inline exactly where stock had them: an `IsoDeadBody`, which goes into the
+cell's shared remove set, and the reused-zombie debug branch. Anything the batch did not take runs inline as before.
+
+The batch is per bucket and never spans two of them. `GameTime.perObjectMultiplier` is set to the bucket's frame mod at
+the top of `update(int)` and back to 1 at the bottom; it is one field on the `GameTime` singleton, so it is only constant
+— and the entities' timing only correct — while a single bucket's entities are in flight. Running the batch inside that
+window is what makes the multiplier the right one for every entity in it; batching two buckets at once would let each
+publish its own multiplier and every entity would read whichever landed last.
+
+An entity that throws on a worker is reported once and turns the batching off for the rest of the session, so the bucket
+walks the stock loop from the next frame on; a failed entity is not retried, because the entities before it in the batch
+have already updated this frame and `ECSEntity` refuses a second update in the same frame.
+
+Default off. Unlike the postupdate batches, this one moves the simulation itself: the entities' writes still all happen,
+but their order within the frame is no longer the bucket's list order, so it is opt-in until the checksum rig has run
+over a route. `tests/pzopt/UpdateBatchTest` drives the batch with real `IsoMovingObject`s and pins the four-call
+sequence, once per entity, across threads, plus the failure latch.
