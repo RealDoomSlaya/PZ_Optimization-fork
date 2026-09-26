@@ -4241,3 +4241,46 @@ FrameBatch worker) plus the first-failure stack trace and the one-line repeat.
   semantics themselves (a list mutated mid-iteration surviving because the iteration holds a frozen copy) are not
   separately exercised at runtime — a bare JVM has no async pathfinder to race against; the bytecode pin plus the
   serial-aliasing argument above are the evidence.
+
+## zombie.iso.IsoMovingObject: the position snapshot and the tile-update deferral (`entityUpdateParallel`, new override)
+
+The first live A/B of `entityUpdateParallel` (Louisville, ~4,000 zombies, 25 s, 11.9 → 22.0 fps) left a measured
+residue: 27 caught StateMachine exceptions against 0 in the baseline, 20 of them the zero-length ForwardDirection
+throw on the GAME thread — a worker read another entity's `x`/`y`/`z` while a second worker was writing them, and
+the torn value surfaced a frame later, past every worker-side guard. This override is PZMulticore's v1.4 answer
+(its `IsoMovingObjectPatcher`) rebuilt as a pzopt override; it exists to take that residue to zero.
+
+- Four new public fields, all marked `pzopt: entityUpdateParallel`: `pzoptSnapshotIndex` + `pzoptSnapshotFrame`
+  (the entity's slot in `UpdateBatch`'s frozen position arrays, valid only while the frame stamp matches the
+  batch), and `pzoptDeferredSquare` + `pzoptDeferredSquareFrame` (the latched `setMovingSquare` argument, below).
+  Deliberately no initializers: a fresh entity's stamp of 0 never matches a batch (the counter starts at 1), so
+  every constructor stays byte-identical to stock.
+- `getX()`, `getY()`, `getZ()`: one guard line at entry. While a batch is in flight (`UpdateBatch.frozen(this)`:
+  volatile read, false costs nothing with the key off), an entity whose stamp matches the batch answers with the
+  position frozen on the game thread just before dispatch — unless the caller is the task updating that very
+  entity (`ThreadLocal` in UpdateBatch), which must see its own writes live. Only the queued entities are
+  snapshotted: players, animals and grappled zombies ran inline before `run()` and cannot move mid-window. The
+  happens-before is the array-and-stamp population on the game thread before the volatile `inFlight` write,
+  volatile-read first in `frozen()`. Staleness is the stamp — no clear pass after the join.
+- `setMovingSquare()`: one guard line at entry. The stock body mutates the target square's shared
+  `MovingObjects` ArrayList — two workers landing entities on one square is a plain list race. A call made from
+  inside a batched entity's update (any thread; the game thread works the batch too) is latched on the entity
+  (last call wins) and the game thread replays it through the real method right after the join, also after a
+  failed batch. This goes one step past the PZMulticore reference, which skips the call outright: the only other
+  writer for a zombie is `postupdate()`'s `setMovingSquare(this.current)` on the game thread, so a pure skip
+  merely delays the square hand-off by half a frame there — but the replay makes the per-frame end state exactly
+  stock's serial outcome, latched callees do not even need to be in the queue, and nothing is left to chance.
+- `removeFromSquare()`, marked `pzopt: decompiler fix`: the jar chains the two null stores
+  (`this.current = this.last = null`, one `aconst_null` + `dup_x1`); CFR split them into two statements. Verified
+  by the bytecode audit — 0 mismatches over the class's unedited methods.
+
+Key: `entityUpdateParallel` (the layer is part of the feature, not separately switchable — turning it off alone
+would reintroduce the torn reads the feature cannot ship with). The UpdateBatch side: snapshot arrays grown
+never-shrunk, `CURRENT` set/cleared around the four calls per task, the deferred-square replay drained through a
+`ConcurrentLinkedQueue` with a stamp check so a racing double-add applies once, and `describe()` now counts
+`movingSquareDeferred`; the harness summary's `zombie_batches=` line carries `UpdateBatch.describe()` so every
+run reports batch counts, Lua suppressions, pathfind skips and deferrals. `tests/pzopt/PositionSnapshotTest`
+pins frozen cross-entity reads (latch-ordered, no scheduling luck), live self-reads, live-again after the join,
+staleness across batches and never-batched entities; `tests/pzopt/MovingSquareDeferralTest` pins stock behavior
+outside a window, the untouched shared list mid-window, the replay's end state, last-call-wins, and a batched
+update writing a non-queued entity's square.

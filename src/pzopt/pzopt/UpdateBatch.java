@@ -37,6 +37,93 @@ public final class UpdateBatch {
    private static volatile boolean failed;
    private static volatile boolean inFlight; // set/cleared by run() around FrameBatch.run: the entity batch is on the workers now
 
+   // ── position snapshot (the PZMulticore IsoMovingObjectPatcher layer, pzopt-shaped) ──────────────────────────
+   //
+   // The first live A/B's residue was 20 zero-length ForwardDirection throws on the GAME thread: a worker read
+   // another entity's x/y/z while a second worker was writing them, and the torn value surfaced a frame later.
+   // So for the window of one batch, a cross-entity getX()/getY()/getZ() answers from these arrays — the position
+   // frozen on the game thread just before dispatch — while a self-read (the entity the current task is updating,
+   // CURRENT) stays live. Only the queued entities are snapshotted: everything else (players, animals, grappled
+   // zombies) ran inline before run() and is motionless while the batch is in flight.
+   //
+   // Validity is the per-entity frame stamp against snapshotFrame — no clear pass after the join, a stale index
+   // from an earlier batch simply stops matching. Happens-before: the arrays and stamps are written on the game
+   // thread BEFORE the volatile write to inFlight; every reader volatile-reads inFlight first (frozen()).
+   private static volatile float[] snapX = new float[4096];
+   private static volatile float[] snapY = new float[4096];
+   private static volatile float[] snapZ = new float[4096];
+   private static volatile long snapshotFrame;
+   private static final ThreadLocal<IsoMovingObject> CURRENT = new ThreadLocal<>();
+
+   /**
+    * True when this entity's position must be read from the snapshot: a batch is in flight, the entity is in it
+    * (its stamp matches this batch), and the caller is not the task updating it. Called by the IsoMovingObject
+    * override's getX/getY/getZ — with the key off the volatile is always false and nothing else is read.
+    */
+   public static boolean frozen(IsoMovingObject entity) {
+      return inFlight && entity.pzoptSnapshotFrame == snapshotFrame && entity != CURRENT.get();
+   }
+
+   /** The frozen X of an entity {@link #frozen} said yes for. */
+   public static float frozenX(IsoMovingObject entity) {
+      return snapX[entity.pzoptSnapshotIndex];
+   }
+
+   /** The frozen Y of an entity {@link #frozen} said yes for. */
+   public static float frozenY(IsoMovingObject entity) {
+      return snapY[entity.pzoptSnapshotIndex];
+   }
+
+   /** The frozen Z of an entity {@link #frozen} said yes for. */
+   public static float frozenZ(IsoMovingObject entity) {
+      return snapZ[entity.pzoptSnapshotIndex];
+   }
+
+   // ── setMovingSquare deferral ────────────────────────────────────────────────────────────────────────────────
+   //
+   // setMovingSquare mutates the target square's shared MovingObjects ArrayList; two workers landing entities on
+   // one square is a plain list race. A call made from inside a batched entity's update is latched on the entity
+   // (last call wins, like the serial loop's end state) and replayed by the game thread right after the join. The
+   // PZMulticore reference skips the call outright; a pzopt batch can replay on the game thread, so nothing goes
+   // stale. The latched entity need not be in the queue — an update may set a square on another entity.
+   private static final java.util.concurrent.ConcurrentLinkedQueue<IsoMovingObject> deferredSquares =
+         new java.util.concurrent.ConcurrentLinkedQueue<>();
+   private static long movingSquareDeferred;
+
+   /**
+    * Called by the IsoMovingObject override at the top of setMovingSquare. True = the call was latched (the
+    * caller returns without touching the square lists); false = no batch window, run the stock body.
+    */
+   public static boolean deferMovingSquare(IsoMovingObject entity, zombie.iso.IsoGridSquare square) {
+      if (!inFlight || CURRENT.get() == null) {
+         return false;
+      }
+
+      if (entity.pzoptDeferredSquareFrame != snapshotFrame) {
+         entity.pzoptDeferredSquareFrame = snapshotFrame;
+         deferredSquares.add(entity); // two racing stamp reads may add twice; the replay's stamp check drops the twin
+      }
+
+      entity.pzoptDeferredSquare = square;
+      return true;
+   }
+
+   /** Game thread, after the join: apply the last latched square per entity through the real setMovingSquare. */
+   private static void applyDeferredSquares() {
+      IsoMovingObject entity;
+      while ((entity = deferredSquares.poll()) != null) {
+         if (entity.pzoptDeferredSquareFrame != snapshotFrame) {
+            continue; // a duplicate queue entry: this entity was already applied
+         }
+
+         entity.pzoptDeferredSquareFrame = 0L;
+         zombie.iso.IsoGridSquare square = entity.pzoptDeferredSquare;
+         entity.pzoptDeferredSquare = null;
+         entity.setMovingSquare(square); // inFlight is false again, so this runs the stock body
+         movingSquareDeferred++;
+      }
+   }
+
    /**
     * True only on a {@link FrameBatch.Worker} while this batch's entities are in flight — the one predicate every
     * thread-safety guard of {@code entityUpdateParallel} keys on (the ForwardDirection throw, the LuaEventManager
@@ -129,19 +216,51 @@ public final class UpdateBatch {
 
       long w0 = FrameBatch.workNanos;
       long q0 = FrameBatch.waitNanos;
+
+      // Freeze the queued entities' positions BEFORE the volatile write to inFlight below: that ordered pair is
+      // the happens-before that lets workers read the arrays and stamps without a lock.
+      snapshotFrame++;
+      if (snapX.length < n) {
+         int size = Math.max(n, snapX.length * 2);
+         snapX = new float[size];
+         snapY = new float[size];
+         snapZ = new float[size];
+      }
+      float[] sx = snapX;
+      float[] sy = snapY;
+      float[] sz = snapZ;
+      long frame = snapshotFrame;
+      for (int i = 0; i < n; i++) {
+         IsoMovingObject entity = queue[i];
+         sx[i] = entity.getX(); // still live here: inFlight is false until the write below
+         sy[i] = entity.getY();
+         sz[i] = entity.getZ();
+         entity.pzoptSnapshotIndex = i;
+         entity.pzoptSnapshotFrame = frame;
+      }
+
       Throwable t;
-      inFlight = true; // onWorkerNow(): the workers are running this batch's entities from here to the finally
+      inFlight = true; // onWorkerNow() and frozen(): the workers are running this batch's entities from here to the finally
       try {
          t = FrameBatch.run(n, i -> {
             IsoMovingObject entity = queue[i];
-            entity.setCurrentSimulationLevel(level);
-            entity.preupdate();
-            entity.frameStep();
-            entity.update();
+            CURRENT.set(entity); // frozen(): this task's entity reads itself live, everyone else frozen
+            try {
+               entity.setCurrentSimulationLevel(level);
+               entity.preupdate();
+               entity.frameStep();
+               entity.update();
+            } finally {
+               CURRENT.set(null); // a pooled worker must not carry the reference into the next task
+            }
          });
       } finally {
          inFlight = false;
       }
+
+      // The window's latched setMovingSquare calls, applied in one place on the game thread — also after a
+      // failed batch, so a partially updated frame still lands its tile updates instead of leaking them.
+      applyDeferredSquares();
       workNanos += FrameBatch.workNanos - w0;
       waitNanos += FrameBatch.waitNanos - q0;
       if (t != null) {
@@ -214,6 +333,7 @@ public final class UpdateBatch {
       return "update batch: frames=" + frames + " batched=" + batched + " max=" + maxBatch
             + " work ms=" + (workNanos / 1_000_000L) + " wait ms=" + (waitNanos / 1_000_000L)
             + " luaSuppressed=" + luaSuppressed.get() + " pathfindRaceSkipped=" + pathfindRaceSkipped.get()
+            + " movingSquareDeferred=" + movingSquareDeferred
             + (failed ? " FAILED" : "");
    }
 }
