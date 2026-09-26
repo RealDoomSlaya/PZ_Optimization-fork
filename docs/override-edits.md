@@ -4365,3 +4365,33 @@ are the static-scratch audit's follow-up. `tests/pzopt/ForwardDirectionScratchTe
 method still uses the static (a TIS rework would be noticed), that the override's method touches no
 `tempVector2_2` and routes through `dirScratch()`, and that the scratch is per-thread; a runtime hammer
 needs a constructible IsoGameCharacter, which a bare JVM does not have.
+
+## zombie.characters.animals.IsoAnimal: updateLOS skips the no-effect far-zombie calls (`animalLosFast`, new override)
+
+Vanilla `updateLOS` walks the WHOLE cell object list once per animal per frame and calls
+`BaseAnimalBehavior.spotted(zombie, false, dist)` for every zombie in it — animals x objects, the quadratic
+behind updateLOS's 4% of the game thread in the maintainer's farm profile (on the Louisville horde it is
+0.45%: almost no animals near the route, ~4,000 objects each). Read from the pinned jar: for a zombie
+farther than 10 tiles (square non-null) the call's whole observable effect is `parent.spottedChr = null`
+plus one `lastAlerted` subtract-then-clamp — the stress/flee/alert branches all need `dist <= 10` (wild
+flee needs 3, flee 6), `spotted` cannot become true for a zombie past 10, and no `Rand` is drawn, so the
+shared RNG stream is identical either way.
+
+With `animalLosFast` (default on) the loop skips a zombie's call when its squared distance exceeds 101 —
+the 1.0 margin over 10² guarantees float-sqrt rounding at the boundary can never make vanilla's
+`dist <= 10` true for a skipped zombie — counting each skip (null-square objects are not counted: vanilla
+gives them no call either). The bookkeeping is replayed exactly where vanilla would have applied it:
+before the next executed `spotted()` call (which re-nulls `spottedChr` itself at entry),
+`AnimalLos.decay` applies the same N sequential subtract-then-clamp steps N vanilla calls would have — a
+loop, not one multiply, because float subtraction is not associative and the clamp can hit zero mid-run —
+and after the loop the remaining skips also null `spottedChr`. Player calls are never skipped (their
+acceptance/wild-spotting logic reaches past 10 tiles and draws from `Rand`).
+
+Also in this file, marked `pzopt: decompiler fix`: three `CreateItem`/`Translator` results CFR typed as
+`Object` (casts restored), and `fertilize`'s two branched `getData().maleGenome` stores that CFR folded
+into one ternary assignment (the jar's if/else shape restored) — all verified by the bytecode audit
+(0 mismatches over the class's unedited methods). `tests/pzopt/AnimalLosTest` pins `decay` bit-exact
+against the vanilla step sequence and, in bytecode, that the jar's `updateLOS` has no pzopt call while the
+override's still calls `spotted` and routes the skip accounting through `AnimalLos.decay`; a runtime drive
+needs a constructible IsoAnimal with a populated cell, which a bare JVM does not have (the constructor
+chain pulls AnimalDefinitions through the script engine).
