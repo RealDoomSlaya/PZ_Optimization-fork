@@ -291,6 +291,17 @@ local SECTIONS = {
         },
     },
     {
+        title = "Entity updates on the worker threads", clip = "horde",
+        entries = {
+            { key = "entityUpdateParallel", label = "Entity updates on other cores (experimental)",
+              tip = "The update loop itself - the only part of the frame that grows with the whole moving-object population - runs the eligible entities on the worker threads instead of one after another on the game thread, with the stock four-step sequence per entity kept exactly. Players, animals, vehicles and physics objects stay on the game thread; Lua events fired from a worker are replayed on the game thread in the stock order; an entity that fails on a worker turns the batching off for the rest of the session. EXPERIMENTAL: it moves the simulation itself, so it is off by default." },
+            { key = "entityUpdatePipeline", label = "Entity updates: overlap with the next batch",
+              tip = "With entity updates on other cores, the workers finish one batch while the game thread already collects the next, instead of standing still between batches. The frame-timing multiplier each entity reads is captured per batch, so timings stay exactly right. Only active while the setting above is on." },
+            { key = "animalLosFast", label = "Animals: skip far-zombie sight checks",
+              tip = "An animal's line-of-sight update walks every zombie in range even when it is too far to change anything; those calls are skipped with the same bookkeeping applied afterwards (bit-identical numbers), and players are never skipped. Matters on farms and near hordes." },
+        },
+    },
+    {
         title = "Sprite buffers", clip = "drive",
         entries = {
             { key = "persistentVbo", label = "Persistently mapped sprite buffers",
@@ -1154,6 +1165,9 @@ local EFFECTS = {
     lightingStrongDelta = { cpu = 1 },
     lightingStrongBudget = { cpu = -1, gpu = -2 },
     lightingStrongFrameMs = { gpu = -1 },
+    entityUpdateParallel = { cpu = -2, cores = 1 },
+    entityUpdatePipeline = { cores = 1 },
+    animalLosFast = { cpu = -1 },
     animBonesParallel = { cpu = -1, cores = 1 },
     animBonesThreads = { cores = 1 },
     frameThreads = { cores = 1 },
