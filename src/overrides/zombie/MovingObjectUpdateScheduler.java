@@ -177,6 +177,7 @@ public final class MovingObjectUpdateScheduler {
       for (MovingObjectUpdateSchedulerUpdateBucket simulation : this.simulationLevels) {
          simulation.update((int)this.frameCounter);
       }
+      pzopt.UpdateBatch.joinPending(); // pzopt: entityUpdatePipeline -- the last bucket's batch is still airborne (each bucket joined only the PREVIOUS one); nothing past this line may see a half-updated entity, so land it here before postupdate and the render read anything
    }
 
    public void postupdate() {

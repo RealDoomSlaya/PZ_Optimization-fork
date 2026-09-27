@@ -55,6 +55,46 @@ public class ForwardDirectionScratchTest {
       Check.check(invokes(ours, "pzopt/UpdateBatch", "dirScratch"),
             METHOD + " takes its scratch vector from UpdateBatch.dirScratch()");
 
+      // ── the tempo/tempo2 statics: the same disease's siblings, found live by run lou-pipe-off
+      // (ZombieEatBodyState → faceThisObject → the static tempo → the zero-length throw at frame 41).
+      // Every worker-reachable user converts to per-thread scratch; the debug/render/death-path users keep
+      // the statics and stay byte-identical to the jar.
+      String[][] tempoMethods = {
+            {"faceThisObject", "(Lzombie/iso/IsoObject;)V"},
+            {"faceThisObjectAlt", "(Lzombie/iso/IsoObject;)V"},
+            {"facePosition", "(II)V"},
+            {"doDeferredMovement", "()V"},
+            {"getMovementSpeed", "()F"},
+      };
+      ClassModel jarC = jarClass(CLASS);
+      ClassModel ourC = ClassFile.of().parse(Files.readAllBytes(looseClass("zombie.characters.IsoGameCharacter")));
+      for (String[] tm : tempoMethods) {
+         MethodModel jm = namedMethod(jarC, tm[0], tm[1]);
+         Check.check(readsAnyField(jm, "tempo", "tempo2"),
+               "the jar's " + tm[0] + " still uses the static tempo scratch (else re-read the override)");
+         MethodModel om = namedMethod(ourC, tm[0], tm[1]);
+         Check.check(!readsAnyField(om, "tempo", "tempo2"),
+               tm[0] + " no longer touches the static tempo/tempo2 scratch");
+         Check.check(invokes(om, "pzopt/UpdateBatch", "tempoScratch") || invokes(om, "pzopt/UpdateBatch", "tempo2Scratch"),
+               tm[0] + " takes its scratch from UpdateBatch.tempoScratch()/tempo2Scratch()");
+      }
+
+      // ── WalkTowardState's own singleton scratch: the family's last member (run lou-pipe-final, one
+      // WalkTowardState zero-length throw with both statics already converted — the state INSTANCE is a
+      // singleton, so its temp/worldPos fields are shared by every walking zombie on every thread).
+      MethodModel jarExec = namedMethod(jarClass("zombie/ai/states/WalkTowardState.class"),
+            "execute", "(Lzombie/characters/IsoGameCharacter;)V");
+      Check.check(readsAnyField(jarExec, "temp"), "the jar's WalkTowardState.execute uses the singleton temp field");
+      ClassModel wts = ClassFile.of().parse(Files.readAllBytes(looseClass("zombie.ai.states.WalkTowardState")));
+      for (String[] wm : new String[][]{{"execute", "(Lzombie/characters/IsoGameCharacter;)V"},
+            {"calculateTargetLocation", "(Lzombie/characters/IsoZombie;Lzombie/iso/Vector2;)Z"}}) {
+         MethodModel om = namedMethod(wts, wm[0], wm[1]);
+         Check.check(!readsAnyField(om, "temp", "worldPos"),
+               "WalkTowardState." + wm[0] + " no longer touches the singleton temp/worldPos scratch");
+         Check.check(invokes(om, "pzopt/UpdateBatch", "tempoScratch") || invokes(om, "pzopt/UpdateBatch", "walkScratch"),
+               "WalkTowardState." + wm[0] + " takes per-thread scratch");
+      }
+
       // ── the scratch itself: stable per thread, never shared across threads ──
       Object first = UpdateBatch.dirScratch();
       Check.check(first == UpdateBatch.dirScratch(), "dirScratch() is stable on one thread");
@@ -65,6 +105,29 @@ public class ForwardDirectionScratchTest {
       Check.check(other.get() != null && other.get() != first, "dirScratch() is a different vector on a different thread");
 
       System.out.println("ForwardDirectionScratchTest ok");
+   }
+
+   private static MethodModel namedMethod(ClassModel model, String name, String desc) {
+      for (MethodModel m : model.methods()) {
+         if (m.methodName().stringValue().equals(name) && m.methodTypeSymbol().descriptorString().equals(desc)) {
+            return m;
+         }
+      }
+      throw new AssertionError("FAILED: " + name + desc + " not found");
+   }
+
+   private static boolean readsAnyField(MethodModel m, String... names) {
+      boolean[] found = {false};
+      m.code().orElseThrow().forEach(el -> {
+         if (el instanceof FieldInstruction f) {
+            for (String n : names) {
+               if (f.name().stringValue().equals(n)) {
+                  found[0] = true;
+               }
+            }
+         }
+      });
+      return found[0];
    }
 
    private static MethodModel method(ClassModel model) {

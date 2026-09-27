@@ -3384,7 +3384,7 @@ public final class IsoZombie extends IsoGameCharacter implements IHumanVisual {
    public boolean allowsInvisibleAnimationSkips() {
       if (GameClient.client && this.isRemoteZombie()) {
          return false;
-      } else if (GameTime.getInstance().perObjectMultiplier > 1.0F) {
+      } else if (pzopt.UpdateBatch.pom(GameTime.getInstance()) > 1.0F) { // pzopt: entityUpdateParallel -- a batch task reads its bucket's dispatch-time multiplier through pom() (the game thread may have moved on to the next bucket's global write); the live field everywhere else
          return false;
       } else {
          return !DebugOptions.instance.zombieAnimationDelay.getValue() ? false : super.allowsInvisibleAnimationSkips();

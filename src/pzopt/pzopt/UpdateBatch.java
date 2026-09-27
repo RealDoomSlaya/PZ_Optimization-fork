@@ -69,6 +69,51 @@ public final class UpdateBatch {
       return DIR_SCRATCH.get();
    }
 
+   // The per-task perObjectMultiplier override: NaN = not inside a batch task (read the live field). A
+   // float[1] holder instead of ThreadLocal<Float> so the per-task set/clear never boxes. Written by the
+   // batch runner from the value captured at dispatch; read by pom() at the five consumer sites so a task
+   // keeps its bucket's multiplier even after the game thread has moved on to the next bucket's write.
+   private static final ThreadLocal<float[]> POM = ThreadLocal.withInitial(() -> new float[]{Float.NaN});
+
+   /** The perObjectMultiplier this thread should see: the dispatch-time capture inside a batch task, the live field otherwise. */
+   public static float pom(zombie.GameTime gameTime) {
+      float v = POM.get()[0];
+      return v == v ? v : gameTime.perObjectMultiplier; // v==v is false only for the NaN sentinel
+   }
+
+   // IsoGameCharacter's static tempo/tempo2 scratch vectors, per thread (the dirScratch disease's siblings:
+   // faceThisObject fills the static tempo and hands it to DirectionFromVector, so two zombies facing
+   // anything concurrently share one vector — run lou-pipe-off caught ZombieEatBodyState throwing the
+   // zero-length exception through exactly that path). Worker-reachable users read these; the debug/render/
+   // death-path users keep the statics.
+   private static final ThreadLocal<zombie.iso.Vector2> TEMPO = ThreadLocal.withInitial(zombie.iso.Vector2::new);
+   private static final ThreadLocal<zombie.iso.Vector2> TEMPO2 = ThreadLocal.withInitial(zombie.iso.Vector2::new);
+
+   /** This thread's tempo scratch vector, for the IsoGameCharacter override. */
+   public static zombie.iso.Vector2 tempoScratch() {
+      return TEMPO.get();
+   }
+
+   /** This thread's tempo2 scratch vector, for the IsoGameCharacter override. */
+   public static zombie.iso.Vector2 tempo2Scratch() {
+      return TEMPO2.get();
+   }
+
+   // WalkTowardState's singleton temp/worldPos scratch, per thread (the State instance is shared by every
+   // walking zombie; its fields are the same disease as the statics above).
+   private static final ThreadLocal<zombie.iso.Vector2> WALK = ThreadLocal.withInitial(zombie.iso.Vector2::new);
+   private static final ThreadLocal<org.joml.Vector3f> WALK3 = ThreadLocal.withInitial(org.joml.Vector3f::new);
+
+   /** This thread's WalkTowardState temp scratch, for that override. */
+   public static zombie.iso.Vector2 walkScratch() {
+      return WALK.get();
+   }
+
+   /** This thread's WalkTowardState worldPos scratch, for that override. */
+   public static org.joml.Vector3f walkScratch3() {
+      return WALK3.get();
+   }
+
    /**
     * True when this entity's position must be read from the snapshot: a batch is in flight, the entity is in it
     * (its stamp matches this batch), and the caller is not the task updating it. Called by the IsoMovingObject
@@ -309,11 +354,66 @@ public final class UpdateBatch {
       queue[count++] = entity;
    }
 
+   // ── the pipeline's one airborne batch (entityUpdatePipeline): dispatched without a join so the game
+   // thread can collect the NEXT bucket while these tasks run; joined before the next dispatch (and after the
+   // last bucket, from the scheduler override), so at most one batch is ever in flight — FrameBatch's own
+   // one-batch rule, kept. The flight owns its entity array (double-buffered with the collection queue), its
+   // dispatch-time perObjectMultiplier (replay runs under it) and its Lua capture count.
+   private static IsoMovingObject[] spareQueue;
+   private static IsoMovingObject[] flightArr;
+   private static int flightN;
+   private static float flightPom;
+   private static boolean flightLuaReplay;
+   private static boolean flightPending;
+   private static volatile Throwable flightFailure;
+   private static int snapAppend; // inline entities stamped into the in-flight snapshot append here
+
+   /** True while a dispatched batch has not been joined yet. */
+   public static boolean hasPendingBatch() {
+      return flightPending;
+   }
+
+   private static long altWindow = Long.MIN_VALUE; // devPipelineAlternate: last logged window index
+
+   /**
+    * Whether this bucket dispatch uses the pipeline. Plain ENTITY_UPDATE_PIPELINE normally; with
+    * devPipelineAlternate=N the answer flips every N seconds inside the run — same zombies, same spawn,
+    * same thermals for both modes — and each flip is logged with its epoch so the frame log splits into
+    * paired windows (drop the first window of each pair as warm-up when analysing).
+    */
+   public static boolean pipelineOn() {
+      int alt = Config.DEV_PIPELINE_ALTERNATE;
+      if (alt <= 0) {
+         return Config.ENTITY_UPDATE_PIPELINE;
+      }
+      long now = System.currentTimeMillis();
+      long window = now / (alt * 1000L);
+      boolean on = (window & 1L) == 0L;
+      if (window != altWindow) {
+         altWindow = window;
+         Log.info("pipeline-alt: window " + (on ? "on" : "off") + " @" + now);
+      }
+      return on;
+   }
+
    /**
     * Game thread, at the end of one bucket's collection: run the collected entities' update sequence on the
-    * workers and drain the queue. Returns false when there was nothing to do.
+    * workers and drain the queue. Returns false when there was nothing to do. The synchronous shape —
+    * dispatch, then join — used when the pipeline key is off and by the JVM tests.
     */
    public static boolean run(UpdateSchedulerSimulationLevel level) {
+      boolean dispatched = dispatchAsync(level);
+      joinPending();
+      return dispatched;
+   }
+
+   /**
+    * Game thread: dispatch the collected entities to the workers WITHOUT joining (entityUpdatePipeline). The
+    * caller keeps the game thread busy with the next bucket's collection and calls {@link #joinPending}
+    * before the next dispatch. Any batch still airborne is joined here first, so two can never overlap.
+    */
+   public static boolean dispatchAsync(UpdateSchedulerSimulationLevel level) {
+      joinPending();
       int n = count;
       if (n == 0) {
          return false;
@@ -325,14 +425,13 @@ public final class UpdateBatch {
          maxBatch = n;
       }
 
-      long w0 = FrameBatch.workNanos;
-      long q0 = FrameBatch.waitNanos;
-
       // Freeze the queued entities' positions BEFORE the volatile write to inFlight below: that ordered pair is
-      // the happens-before that lets workers read the arrays and stamps without a lock.
+      // the happens-before that lets workers read the arrays and stamps without a lock. INLINE_SLACK reserves
+      // room for the next bucket's inline entities (players, vehicles, animals) to stamp their post-update
+      // positions in while this batch flies — the arrays never grow mid-flight.
       snapshotFrame++;
-      if (snapX.length < n) {
-         int size = Math.max(n, snapX.length * 2);
+      if (snapX.length < n + INLINE_SLACK) {
+         int size = Math.max(n + INLINE_SLACK, snapX.length * 2);
          snapX = new float[size];
          snapY = new float[size];
          snapZ = new float[size];
@@ -341,63 +440,105 @@ public final class UpdateBatch {
       float[] sy = snapY;
       float[] sz = snapZ;
       long frame = snapshotFrame;
+      final IsoMovingObject[] q = queue; // the flight owns THIS array; the next collection gets the spare
       for (int i = 0; i < n; i++) {
-         IsoMovingObject entity = queue[i];
+         IsoMovingObject entity = q[i];
          sx[i] = entity.getX(); // still live here: inFlight is false until the write below
          sy[i] = entity.getY();
          sz[i] = entity.getZ();
          entity.pzoptSnapshotIndex = i;
          entity.pzoptSnapshotFrame = frame;
       }
+      snapAppend = n;
 
       boolean luaReplay = Config.ENTITY_UPDATE_LUA_REPLAY;
       if (luaReplay && luaCaptures.length < n) {
          luaCaptures = java.util.Arrays.copyOf(luaCaptures, Math.max(n, luaCaptures.length * 2));
       }
 
-      Throwable t;
-      inFlight = true; // onWorkerNow() and frozen(): the workers are running this batch's entities from here to the finally
-      try {
-         t = FrameBatch.run(n, i -> {
-            IsoMovingObject entity = queue[i];
-            CURRENT.set(entity); // frozen(): this task's entity reads itself live, everyone else frozen
-            java.util.ArrayList<Object[]> capture = null;
-            if (luaReplay) {
-               capture = luaCaptures[i];
-               if (capture == null) {
-                  capture = new java.util.ArrayList<>();
-                  luaCaptures[i] = capture; // published to the game thread by the join
-               }
-               LUA_CAPTURE.set(capture); // captureLuaEvent appends here for this task
+      // The bucket's frame mod, captured at dispatch: the game thread moves on to the next bucket — and
+      // rewrites the global perObjectMultiplier — while these tasks still run, so every task reads THIS value
+      // through pom() instead of the live field (the five consumer sites are the GameTime getters,
+      // FrameDelay.update and IsoZombie.allowsInvisibleAnimationSkips; PerObjectMultiplierTest).
+      final float pomAtDispatch = zombie.GameTime.getInstance().perObjectMultiplier;
+      final boolean flightReplay = luaReplay;
+
+      flightFailure = null;
+      inFlight = true; // onWorkerNow() and frozen(): the workers are running this batch's entities from here to joinPending
+      FrameBatch.runAsync(n, i -> {
+         IsoMovingObject entity = q[i];
+         CURRENT.set(entity); // frozen(): this task's entity reads itself live, everyone else frozen
+         POM.get()[0] = pomAtDispatch; // pom(): this task reads the dispatch-time multiplier
+         java.util.ArrayList<Object[]> capture = null;
+         if (flightReplay) {
+            capture = luaCaptures[i];
+            if (capture == null) {
+               capture = new java.util.ArrayList<>();
+               luaCaptures[i] = capture; // published to the game thread by the join
             }
-            try {
-               entity.setCurrentSimulationLevel(level);
-               entity.preupdate();
-               entity.frameStep();
-               entity.update();
-            } finally {
-               CURRENT.set(null); // a pooled worker must not carry the reference into the next task
-               if (capture != null) {
-                  LUA_CAPTURE.set(null);
-               }
+            LUA_CAPTURE.set(capture); // captureLuaEvent appends here for this task
+         }
+         try {
+            entity.setCurrentSimulationLevel(level);
+            entity.preupdate();
+            entity.frameStep();
+            entity.update();
+         } finally {
+            CURRENT.set(null); // a pooled worker must not carry the reference into the next task
+            POM.get()[0] = Float.NaN; // pom() follows the live field again off-task
+            if (capture != null) {
+               LUA_CAPTURE.set(null);
             }
-         });
-      } finally {
-         inFlight = false;
+         }
+      }, fx -> flightFailure = fx);
+
+      // Hand the owned array to the flight and swap the spare in for the next bucket's collection: the
+      // workers iterate q while add() fills a different array, so the two never race.
+      flightArr = q;
+      flightN = n;
+      flightPom = pomAtDispatch;
+      flightLuaReplay = flightReplay;
+      flightPending = true;
+      queue = spareQueue != null ? spareQueue : new IsoMovingObject[q.length];
+      spareQueue = null;
+      count = 0;
+      return true;
+   }
+
+   /**
+    * Game thread: wait for the airborne batch, then land its window — deferred tile updates, the Lua replay
+    * under ITS dispatch-time multiplier (the game thread's global may already be the next bucket's), the
+    * failure latch. No-op without a pending batch.
+    */
+   public static void joinPending() {
+      if (!flightPending) {
+         return;
       }
+
+      long j0 = System.nanoTime();
+      FrameBatch.join(); // runs the completion above on this thread: flightFailure is set past here
+      waitNanos += System.nanoTime() - j0; // the game thread's cost of this batch IS the join wait: with the
+      // pipeline it did the next bucket's collection instead of task work, so work ms stays ~0 by design
+      inFlight = false;
+      int n = flightN;
 
       // The window's latched setMovingSquare calls, applied in one place on the game thread — also after a
       // failed batch, so a partially updated frame still lands its tile updates instead of leaking them.
       applyDeferredSquares();
 
-      // The window's captured Lua dispatches, in queue order — stock's serial event order — while the bucket's
-      // perObjectMultiplier is still set, so handlers see the same time scale as stock's inline dispatch. Also
-      // after a failed batch: events fired before the throw did fire in stock's semantics too.
-      if (luaReplay) {
-         replayLuaEvents(n);
+      // The window's captured Lua dispatches, in queue order — stock's serial event order — under the
+      // multiplier the batch dispatched with, so handlers see the same time scale as stock's inline dispatch.
+      // Also after a failed batch: events fired before the throw did fire in stock's semantics too.
+      if (flightLuaReplay) {
+         float[] h = POM.get();
+         h[0] = flightPom;
+         try {
+            replayLuaEvents(n);
+         } finally {
+            h[0] = Float.NaN;
+         }
       }
-      workNanos += FrameBatch.workNanos - w0;
-      waitNanos += FrameBatch.waitNanos - q0;
+      Throwable t = flightFailure;
       if (t != null) {
          if (!failed) {
             failed = true; // the bucket walks stock's loop from the next frame on
@@ -409,9 +550,31 @@ public final class UpdateBatch {
          }
       }
 
-      java.util.Arrays.fill(queue, 0, n, null);
-      count = 0;
-      return true;
+      java.util.Arrays.fill(flightArr, 0, n, null);
+      spareQueue = flightArr; // the next dispatch collects into it
+      flightArr = null;
+      flightPending = false;
+   }
+
+   /** Room reserved past the queued block for inline entities stamped mid-flight (players, vehicles, animals). */
+   private static final int INLINE_SLACK = 512;
+
+   /**
+    * Game thread, from the bucket's loop, right after an inline (non-batchable) entity finished its four
+    * calls while a batch is airborne: stamp its post-update position into the in-flight snapshot so the
+    * workers read a stable value — exactly what they saw when inline entities all ran before the dispatch.
+    * Bounded by INLINE_SLACK; past it the entity just stays live (the pre-snapshot behaviour).
+    */
+   public static void stampInline(IsoMovingObject entity) {
+      if (!flightPending || snapAppend >= snapX.length) {
+         return;
+      }
+      int i = snapAppend++;
+      snapX[i] = entity.getX();
+      snapY[i] = entity.getY();
+      snapZ[i] = entity.getZ();
+      entity.pzoptSnapshotIndex = i;
+      entity.pzoptSnapshotFrame = snapshotFrame; // published by the plain writes: a torn read just means one more live read
    }
 
    /** Game thread: drop whatever was collected (a bucket that never reached run()). */

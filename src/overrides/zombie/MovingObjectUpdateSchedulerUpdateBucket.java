@@ -79,12 +79,18 @@ public final class MovingObjectUpdateSchedulerUpdateBucket {
          isoMovingObject.preupdate();
          isoMovingObject.frameStep();
          isoMovingObject.update();
+         pzopt.UpdateBatch.stampInline(isoMovingObject); // pzopt: entityUpdatePipeline -- while the previous bucket's batch is airborne, freeze this inline entity's post-update position so its workers read a stable value (what they saw when inline entities all ran before the dispatch)
       }
 
       if (pzoptBatch) {
          // pzopt: entityUpdateParallel. Same four calls per entity, in the same order, on the workers; an entity
          // that throws is reported once and turns the batching off, so the next frame walks the loop above.
-         pzopt.UpdateBatch.run(this.simulationLevel);
+         if (pzopt.UpdateBatch.pipelineOn()) { // pzopt: entityUpdatePipeline (devPipelineAlternate flips this per window for the same-run A/B) -- the collection above overlapped the previous bucket's flight; land it, then send this bucket up without waiting
+            pzopt.UpdateBatch.joinPending(); // pzopt: entityUpdatePipeline
+            pzopt.UpdateBatch.dispatchAsync(this.simulationLevel); // pzopt: entityUpdatePipeline -- joined by the next bucket's update() or the scheduler override after the last one
+         } else { // pzopt: entityUpdatePipeline
+            pzopt.UpdateBatch.run(this.simulationLevel);
+         } // pzopt: entityUpdatePipeline
       }
 
       GameTime.getInstance().perObjectMultiplier = 1.0F;

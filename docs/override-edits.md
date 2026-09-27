@@ -4408,3 +4408,110 @@ length 1000"), latching batching off for the session. `batchableType` now also e
 thread exactly as with the key off. The same session was otherwise the branch's strongest evidence: ~17,900
 frames of real play with zero caught state exceptions before the vehicle moment. `UpdateBatchTest` pins the
 four exclusions and the zombie/probe admissions.
+
+## entityUpdatePipeline: a bucket's batch flies while the next one collects (GameTime + FrameDelay new overrides, bucket/scheduler edits)
+
+The five simulation buckets each dispatched their batch and JOINED before returning: five sequential
+barriers per frame, the game thread idle at every one. With `entityUpdatePipeline` (default on, under
+`entityUpdateParallel`) the bucket's update() first lands the PREVIOUS bucket's flight (`joinPending`),
+then sends its own collection up without waiting (`dispatchAsync`) — so the next bucket's collection walk,
+its dead-body/reused-zombie branches and its inline entities (players, vehicles, animals, grappled
+zombies) all run while the previous batch's workers are still busy. The scheduler override joins once more
+after the last bucket, so postupdate and the render never see an airborne batch; FrameBatch's
+one-batch-at-a-time rule holds throughout (dispatch always joins first).
+
+Two consistency pieces make the overlap safe:
+
+- **perObjectMultiplier virtualization.** The global field belongs to whichever bucket the game thread is
+  IN — the airborne batch's tasks would read the wrong bucket's frame mod. Jar-wide the field funnels
+  through five read sites (the three GameTime getters, `FrameDelay.update`,
+  `IsoZombie.allowsInvisibleAnimationSkips`); each now reads `pzopt.UpdateBatch.pom(gameTime)` — the
+  dispatch-time capture while this thread runs one of the batch's tasks (a no-boxing float[1]
+  ThreadLocal), the live field otherwise, so off-batch behaviour is bit-identical. The Lua replay at the
+  join runs under the same holder: handlers see their own bucket's time scale even though the game
+  thread's global already belongs to the next bucket. `PerObjectMultiplierTest` pins all five sites in
+  bytecode (jar raw, override routed) and drives the capture semantics through a real racing batch.
+- **Inline entities stamp into the in-flight snapshot.** Serially, inline entities finished before the
+  dispatch, so workers always read their settled positions; overlapped, they move mid-flight. After an
+  inline entity's four calls the bucket loop stamps its post-update position into the airborne batch's
+  snapshot (`stampInline`, append past the queued block, `INLINE_SLACK` reserved so the arrays never grow
+  mid-flight; past the slack the entity simply stays live). The stamp's plain writes mean a torn read is
+  just one more live read.
+
+The queue is double-buffered (the flight owns its array; the next collection gets the spare), captures
+replay in queue order at the landing exactly as before, and a worker failure latches at the join as
+before. With the key off, `run()` is dispatch-then-join — the old synchronous shape, and what the JVM
+tests drive. `PipelineTest` pins the wiring (bucket dispatches async + joins the previous, scheduler holds
+the final join) and the discriminating runtime: with every task finished on the workers, nothing has
+replayed until `joinPending`. Also in the new GameTime override, marked `pzopt: decompiler fix`: two
+`Translator` results CFR typed as `Object`, and `daysInMonth`'s compound array assignment CFR expanded
+(one extra index constant) — audit 0 mismatches over the class's unedited methods.
+
+### zombie.characters.IsoGameCharacter: the tempo/tempo2 statics off the worker path (`entityUpdateParallel`)
+
+Run lou-pipe-off caught the dirScratch disease's sibling: ZombieEatBodyState threw the zero-length
+ForwardDirection exception through `faceThisObject`, whose jar body fills the STATIC `tempo` Vector2 and
+hands it to `DirectionFromVector` — two zombies facing anything concurrently share that one vector (the
+vehicle branch even calls `setForwardDirection` unguarded). The worker-reachable users — `faceThisObject`,
+`faceThisObjectAlt`, `facePosition`, `doDeferredMovement` (tempo) and `getMovementSpeed` (tempo2) — now
+take `pzopt.UpdateBatch.tempoScratch()` / `tempo2Scratch()` (per-thread, a method-local shadowing the
+static where the body uses the bare name, so the diff is one inserted line each). Per-thread scratch is
+behaviour-identical to the static for a single thread by definition, so the game-thread paths are
+untouched; the debug/render/death-path users (`renderDebugData`, `Throw`, `doDeathSplatterAndSounds`,
+`isObjectBehind`/`isBehind`…) keep the statics and stay byte-identical to the jar.
+ForwardDirectionScratchTest pins the five methods (jar reads the statics, override routes through the
+scratch getters) beside its tempVector2_2 pins.
+
+## zombie.ai.states.WalkTowardState: the singleton's scratch per thread (`entityUpdateParallel`, new override)
+
+The scratch family's last member, caught by run lou-pipe-final with both static scratches already
+converted: one WalkTowardState zero-length throw remained. The State instance is a SINGLETON — its
+`temp` Vector2 and `worldPos` Vector3f fields are shared by every walking zombie on every thread, and
+execute()'s whole direction computation (write targetX/targetY, subtract the position, offset, normalize,
+setDir, setForwardDirection) runs on `temp` across that window. `execute` and `calculateTargetLocation`
+now take per-thread vectors (`UpdateBatch.walkScratch()` / `walkScratch3()`) as method-locals shadowing
+the fields — one inserted line each, the bodies otherwise identical, per-thread scratch being
+behaviour-identical to the singleton field for a single thread. The fields themselves stay (enter/exit
+and the jar's shape untouched). ForwardDirectionScratchTest pins both methods beside the
+tempVector2_2/tempo pins.
+
+### fmod.fmod.FMODSoundEmitter: the emitter under its own lock (`entityUpdateParallel`)
+
+Run lou-pipe-clean2, the pipeline's first casualty: with bucket k airborne while bucket k+1 collects, the
+inline player fought zombies of the airborne bucket — its combat wrote into a zombie's emitter (playSound →
+the sound lists and the slot BitSet) while that zombie's worker task ticked the same emitter.
+`BitSet.clear(-1)` latched batching off at f:15 (the guard worked), but the race had already corrupted the
+emitter's sound list, and at f:366 the SERIAL path ticked the same emitter into
+`FMOD_Studio_GetPlaybackState(NULL)` — a native-argument NPE on the game thread, fatal (PZ saved and
+exited). This is also the branch's oldest ghost: the pre-guard wired run died with the identical
+"Index -1 out of bounds for length 2" at frame 10. All 23 list-touching entry points of the emitter — tick,
+the playSound family, stop/volume/3D/parameter, the isPlaying readers, the private stopSound overload —
+now hold the emitter's own monitor (`synchronized`, the ZombieGroupManager idiom): uncontended on the
+serial path, and every combination (worker vs inline game thread, worker vs worker) serializes.
+`tests/pzopt/EmitterLockTest` pins ACC_SYNCHRONIZED on exactly that surface and its absence in the jar; a
+runtime hammer needs the native FMOD system.
+
+### fmod.fmod.FMODSoundEmitter: the NULL event handle refused (`entityUpdateParallel`)
+
+Runs lou-pipe-clean2/3, both dying ~25-40 frames after route start at the ~4,200-zombie vocal storm, with
+the emitter lock already held and no worker-side signature: a stock bug our throughput exposes. The
+creation site guards FMOD's negative error codes (`eventInstance < 0`) but STORES the NULL handle (0) a
+saturated Studio system returns; the 0 survives its first tick (`isStarting` skips the state read) and
+kills the game on its second — `FMOD_Studio_GetPlaybackState(NULL)`, a native-argument NPE on whichever
+thread ticks it, fatal on the game thread. The guard is now `<= 0` (refusing the NULL exactly as stock
+refuses every other creation failure) plus a belt in `EventSound.tick`: a zeroed handle reports the sound
+finished instead of reaching the native. Load-dependent, not thread-dependent — vanilla can hit this under
+any heavy enough sound load.
+
+### The pipeline's measurement (`devPipelineAlternate`, and why the cross-run numbers lied)
+
+Cross-run Louisville comparisons are confounded twice: population=max spawns vary per run, AND a faster
+build loads MORE zombies by route start (the count is taken at route start), so an improvement penalizes
+itself. `devPipelineAlternate=N` is the repo's devPplAlternate pattern applied to the batch: the bucket
+seam flips entityUpdatePipeline on/off every N seconds inside one run (each flip logged with its epoch),
+so the frame log splits into paired windows over the identical population. First reading
+(lou-pipe-alt, 45 s route, 4 s windows, 3 route windows per mode, 2,944 zombies): a wash — mean 38.8 ms
+off vs 39.7 ms on, p50/p90 slightly for on, p99/max for off. The overlap window as first built holds
+little (collection is microseconds and the join helps), so the win waits on real work moving into it
+(deferred ticks, replay distribution); the key ships ON by the maintainer-side decision of 2026-09-26,
+with this measurement as the honest record and the rig as the permanent instrument.

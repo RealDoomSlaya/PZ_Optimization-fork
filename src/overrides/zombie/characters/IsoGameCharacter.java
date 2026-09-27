@@ -1621,7 +1621,7 @@ public abstract class IsoGameCharacter
          }
 
          if (GameServer.server || this.isAnimationUpdatingThisFrame()) {
-            Vector2 dMovement = tempo;
+            Vector2 dMovement = pzopt.UpdateBatch.tempoScratch(); // pzopt: entityUpdateParallel -- the static tempo scratch is shared by every character on every thread (faceThisObject through the batch threw the zero-length exception in run lou-pipe-off); per-thread scratch, identical output single-threaded
             this.getDeferredMovement(dMovement, true);
             if (this.getPath2() != null && !this.isCurrentState(ClimbOverFenceState.instance()) && !this.isCurrentState(ClimbThroughWindowState.instance())) {
                if (this.isCurrentState(WalkTowardState.instance())
@@ -5853,6 +5853,7 @@ public abstract class IsoGameCharacter
    }
 
    public float getMovementSpeed() {
+      Vector2 tempo2 = pzopt.UpdateBatch.tempo2Scratch(); // pzopt: entityUpdateParallel -- the static tempo scratch is shared by every character on every thread (faceThisObject through the batch threw the zero-length exception in run lou-pipe-off); per-thread scratch, identical output single-threaded
       tempo2.x = this.getX() - this.getLastX();
       tempo2.y = this.getY() - this.getLastY();
       return tempo2.getLength();
@@ -10210,7 +10211,7 @@ public abstract class IsoGameCharacter
 
    public void faceThisObject(IsoObject object) {
       if (object != null) {
-         Vector2 facingPosition = tempo;
+         Vector2 facingPosition = pzopt.UpdateBatch.tempoScratch(); // pzopt: entityUpdateParallel -- the static tempo scratch is shared by every character on every thread (faceThisObject through the batch threw the zero-length exception in run lou-pipe-off); per-thread scratch, identical output single-threaded
          BaseVehicle objVehicle = (BaseVehicle)Type.tryCastTo(object, BaseVehicle.class);
          BarricadeAble barricadeAble = (BarricadeAble)Type.tryCastTo(object, BarricadeAble.class);
          if (objVehicle != null) {
@@ -10247,6 +10248,7 @@ public abstract class IsoGameCharacter
    }
 
    public void facePosition(int x, int y) {
+      Vector2 tempo = pzopt.UpdateBatch.tempoScratch(); // pzopt: entityUpdateParallel -- the static tempo scratch is shared by every character on every thread (faceThisObject through the batch threw the zero-length exception in run lou-pipe-off); per-thread scratch, identical output single-threaded
       tempo.x = x;
       tempo.y = y;
       tempo.x = tempo.x - this.getX();
@@ -10259,6 +10261,7 @@ public abstract class IsoGameCharacter
    }
 
    public void faceThisObjectAlt(IsoObject object) {
+      Vector2 tempo = pzopt.UpdateBatch.tempoScratch(); // pzopt: entityUpdateParallel -- the static tempo scratch is shared by every character on every thread (faceThisObject through the batch threw the zero-length exception in run lou-pipe-off); per-thread scratch, identical output single-threaded
       if (object != null) {
          if (object.hasSpriteGrid()) {
             object = object.getClosestSpriteGridObject(this.getX(), this.getY());
