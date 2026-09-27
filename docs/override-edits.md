@@ -4515,3 +4515,25 @@ off vs 39.7 ms on, p50/p90 slightly for on, p99/max for off. The overlap window 
 little (collection is microseconds and the join helps), so the win waits on real work moving into it
 (deferred ticks, replay distribution); the key ships ON by the maintainer-side decision of 2026-09-26,
 with this measurement as the honest record and the rig as the permanent instrument.
+
+## zombie.statistics.StatisticsManager: the statistics map locked for the batch (`entityUpdateParallel`, new override, 2026-09-27)
+
+The first live modded session (Windows, 322 mods) latched batching off at frame 1: a worker's zombie update
+ran `IsoZombie.updateMovementStatistics` → `StatisticsManager.incrementStatistic`, whose `computeIfAbsent`
+raced another worker's on the singleton's plain `HashMap` — `ConcurrentModificationException`, one report,
+serial for the rest of the session (correct, the latch working as designed, but unbatched: the whole session
+measured the fallback path). The bench saves never see this because the statistics path only ticks with a
+consumer installed; the live save runs a daily-statistics mod.
+
+Every map-touching method of the manager (`incrementStatistic`, `setStatistic`, `getStatistic`,
+`getStatistics`, `getAllStatisticsDebug`, `load`, `save`) is now `synchronized` — the ZombieGroupManager /
+FMODSoundEmitter idiom, uncontended on the serial path. The `Statistic` increment itself is a
+read-modify-write and rides the same lock, so concurrent increments stop losing updates too. The lambdas and
+`getInstance` stay lock-free (they run under the caller's monitor or touch no shared state). `getStatistics`
+returns the live map (stock behaviour, kept); its callers iterate on the game thread, which the lock does not
+cover while a pipeline flight is airborne — no live sighting, watched for.
+
+`tests/pzopt/StatisticsLockTest` pins it structurally like EmitterLockTest: the jar's methods carry no
+ACC_SYNCHRONIZED, the override's seven all do, no strays, method set otherwise identical. No runtime hammer:
+`incrementStatistic` calls into `AchievementManager`, whose initialisation needs platform state a bare JVM
+does not have.
