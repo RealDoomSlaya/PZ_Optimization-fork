@@ -4221,6 +4221,10 @@ FrameBatch worker) plus the first-failure stack trace and the one-line repeat.
 
 ### zombie.pathfind.PathFindBehavior2 (new override)
 
+Superseded on 2026-09-27 by "The pathfinding race was the class's own static scratch" at the end of this file:
+both layers below are retired, the list copy is gone and the counter named here no longer exists. Kept for the
+record of what was tried and why it did not hold.
+
 - `update()`, both layers of PZMulticore's patcher at source level. Layer 1: `this.path.nodes` is read once at
   entry into a local; on a batch task the local is a frozen `clone()` of the list, and every read in the
   method body goes through the local — PZ's async pathfinding writes the live list from its own thread while the
@@ -4823,3 +4827,88 @@ fail for a timing reason, while against the old shape three readers against one 
 over the reset defaults immediately. No performance number is claimed; the change adds a scratch reset and
 a fence to a path that runs once per container per invalidation, and the reason to pay it is that the
 alternative is a session that silently stops measuring what it was launched to measure.
+
+## The pathfinding race was the class's own static scratch (`entityUpdateParallel`, 2026-09-27; PathFindBehavior2 + UpdateBatch)
+
+This supersedes the PathFindBehavior2 entry further up, whose two layers are both retired here. That entry said
+PZ's asynchronous pathfinding writes a character's path list from its own thread while a batch task reads it, and
+answered with a defensive copy of the list taken at the top of the update plus a catch that turned an index or
+state exception on a batch task into a report of still working. A route log then showed between seventy-seven and
+just under a thousand of those catches, which is what sent the reading back for another look. The reading was
+wrong, and both answers were wrong with it.
+
+The writer, precisely. Both pathfinders run their search on their own thread and both write only the request's own
+path object, never a character's. The single piece of code that copies a finished search into a character's path is
+the behaviour's success callback, and its only two callers in the whole jar are the main-thread update of the Java
+map and the main-thread update of the native pathfinder. Both of those run on the game thread, from the game
+state's world-and-managers step, which reaches them only after the world update has returned. The entity flight
+opens and lands inside that world update, because the scheduler joins it in a finally before returning, so a
+delivery cannot overlap a batch task at all. On top of that the behaviour's path field is private, so nothing
+outside the class can reach the list even in principle, and every method of the class that mutates it is invoked
+on the behaviour of the entity being updated, never on another entity's. So the copy was guarding a writer that
+does not exist inside the window, and it cost one list copy per batched zombie per frame to do it.
+
+What does race is four static mutable scratch objects the class keeps for itself: two two-dimensional vectors, a
+three-dimensional vector, and one point-on-path record. Every thread running the update, the two move helpers, the
+crawling-transition check and the path-to-character setup writes and reads those same four objects. The sharpest
+is the point record. The update asks the static helper for the closest point on this character's path, handing it
+the shared record, and reads the path index back out of it on the very next statement. A second task landing
+between those two statements hands this character an index derived from its own, differently sized path. If that
+index is past the end, the node lookup a few lines later throws, and that is the entire population of catches the
+counter was reporting. If it happens to be in range, nothing throws and the character walks the wrong segment of
+its own path in silence. That silent case is the one that mattered, and neither the copy nor the catch touched it.
+The vectors tear the same way and in both directions: the deferred movement is read into the shared vector and
+consumed as a move roughly thirty lines later, so a zombie could be stepped by another zombie's movement vector,
+and the zero-length check in front of the forward-direction write guards a different read of the same shared
+object, which is how a constant direction could still arrive as a zero-length vector.
+
+The shape chosen is neither of the two the review suggested, because neither applies. Deferring the delivery to
+the join would move a write that is already outside the flight; taking a copy of the path at dispatch would freeze
+a list nothing concurrent writes. The fix is instead the idiom this repo already applies three times over to the
+same disease, in the character class's direction and facing scratch and in the walk state's singleton scratch:
+each of the four objects becomes a per-thread object on the batch helper, and every method a batch task can reach
+takes its scratch from there. On one thread the behaviour is exactly what it was, because each use writes and then
+reads inside a single method on a single thread, and that includes the residual state the class relies on, since
+the closest-point helper resets the index but not the distance and the advance helper accumulates into it. Stock
+carried that residue over from whichever call ran last anywhere; a thread's own object carries it over from that
+thread's own calls, which is the repair rather than a change. Across threads there is no shared write left. In
+each converted method the local deliberately takes the same name as the static field it replaces, so the body is
+otherwise untouched, and the test pins in bytecode that no read of any of the four statics survives in any of
+those methods, which is what turns a missed use into a build failure instead of a silent hole.
+
+Three places were deliberately left on the statics. The debug render method is game-thread only and gated behind a
+debug option, and once no batch task touches the statics nothing else writes them, so it keeps them and stays
+byte-identical to the jar. The vehicle-adjacent path setup has no caller anywhere in the jar and is reached only
+from Lua, which also runs on the game thread, for the same reason. The pooled debug-point allocator in the update
+is only reached with the debug flag on and only for a player, and players never run on a worker.
+
+The copy of the list is gone, so the index and the nodes come from one list again, as they do in stock. The catch
+stays, but it no longer swallows anything: a batch task's throw is counted under its own name on the batch status
+line, the first one logs its whole stack with a message saying plainly that the analysis above is wrong if this
+ever fires, and the exception is rethrown on every thread. That makes behaviour identical to vanilla on and off a
+batch, which matters because the one thing that can still legitimately reach the catch is vanilla's own shape: an
+empty path with the finder reporting a result found indexes past the end in stock too, and must keep throwing
+there. The counter's meaning is therefore inverted. It used to count damage absorbed; it now counts the analysis
+failing, and a route log reading zero is the evidence that the race is closed.
+
+`tests/pzopt/PathfindRaceGuardTest` replaces its own earlier contents. Four groups of pins. The jar pins record
+the facts the fix rests on so a game update that moves any of them fails the build: that the success callback is
+invoked from exactly the two main-thread update methods and from nowhere else, that neither pathfind thread's loop
+invokes it, that the world update runs before the managers step inside the game state's frame and that the cell's
+object pass is what drives the entity scheduler, that the path field is private, and that the four scratch fields
+are still static and still read by each of the five reachable methods. The override pins say those five methods
+read none of the four and route through the per-thread holders, that the render method still uses the statics on
+purpose, and that no list copy is left. The holders themselves are checked for per-thread identity and stability.
+The derived-index case is the runtime evidence and is one-sided by construction: four threads walk four paths of
+different lengths and read the index straight back out, which is the two statements the update runs back to back,
+and through a per-thread holder a thread can only ever read the index it just wrote, so the assertion cannot fail
+for a timing reason. Beside it the identical hammer runs through one shared record, and that control is asserted
+to see violations, so the invariant cannot pass vacuously; it finds tens of thousands of them in a few seconds.
+The catch case drives the real update on real characters through a real batch and asserts the throw now escapes on
+every thread, worker and game-thread participant alike, counted exactly once each. What is not exercised at
+runtime is the end-to-end update on a multi-node path, because the closest-point walk needs a real cell to ask for
+grid squares and a bare JVM has none; the derived-index hammer covers the exact statements the defect lived in
+instead, and the bytecode pins cover the rest of the method. No performance number is claimed. The change removes
+a per-entity list copy and adds one thread-local read per scratch object per call, and the reason to make it is
+that the alternative leaves an unknown number of zombies a frame walking somebody else's path with no signal at
+all.

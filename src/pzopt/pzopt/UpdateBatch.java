@@ -114,6 +114,46 @@ public final class UpdateBatch {
       return WALK3.get();
    }
 
+   // PathFindBehavior2's four static scratch objects, per thread (the same disease again, and the one the
+   // "async pathfinding race" was misread as). The class holds tempVector2, tempVector2_2, tempVector3f_1 and
+   // pointOnPath as STATIC mutable objects, and every batch task's update() writes and reads them. pointOnPath
+   // is the sharp one: update() calls closestPointOnPath(..., this.path, pointOnPath) and reads
+   // pointOnPath.pathIndex back on the NEXT line, so a task landing between the two statements takes an index
+   // derived from another character's path — too large and the following nodes.get throws IndexOutOfBounds (the
+   // 77-958 counted escapes a route), in range and the zombie silently walks the wrong segment of its own path.
+   // The vectors tear the same way: getDeferredMovement(tempVector2_2) then moveUnmodded(tempVector2_2.x, ...)
+   // thirty lines later moves this character by whatever another one wrote in between, and the
+   // getLengthSquared() > 0 guard in front of setForwardDirection can be true when the read a line later is
+   // (0,0). Per-thread is exact single-threaded: one thread sees one object, written then read inside one
+   // method, residual state included (closestPointOnPath resets pathIndex but not dist, and advanceAlongPath
+   // accumulates into dist — stock carries that over from the previous call on the static, and a thread's own
+   // holder carries it over the same way, now only from its own calls).
+   private static final ThreadLocal<zombie.iso.Vector2> PATH = ThreadLocal.withInitial(zombie.iso.Vector2::new);
+   private static final ThreadLocal<zombie.iso.Vector2> PATH2 = ThreadLocal.withInitial(zombie.iso.Vector2::new);
+   private static final ThreadLocal<org.joml.Vector3f> PATH3 = ThreadLocal.withInitial(org.joml.Vector3f::new);
+   private static final ThreadLocal<zombie.pathfind.PathFindBehavior2.PointOnPath> PATH_POINT =
+         ThreadLocal.withInitial(zombie.pathfind.PathFindBehavior2.PointOnPath::new);
+
+   /** This thread's PathFindBehavior2 tempVector2 scratch, for that override. */
+   public static zombie.iso.Vector2 pathScratch() {
+      return PATH.get();
+   }
+
+   /** This thread's PathFindBehavior2 tempVector2_2 scratch, for that override. */
+   public static zombie.iso.Vector2 pathScratch2() {
+      return PATH2.get();
+   }
+
+   /** This thread's PathFindBehavior2 tempVector3f_1 scratch, for that override. */
+   public static org.joml.Vector3f pathScratch3() {
+      return PATH3.get();
+   }
+
+   /** This thread's PathFindBehavior2 pointOnPath scratch, for that override. */
+   public static zombie.pathfind.PathFindBehavior2.PointOnPath pathPointScratch() {
+      return PATH_POINT.get();
+   }
+
    /**
     * True when this entity's position must be read from the snapshot: a batch is in flight, the entity is in it
     * (its stamp matches this batch), and the caller is not the task updating it. Called by the IsoMovingObject
@@ -1104,7 +1144,7 @@ public final class UpdateBatch {
    }
 
    private static final java.util.concurrent.atomic.AtomicLong luaSuppressed = new java.util.concurrent.atomic.AtomicLong();
-   private static final java.util.concurrent.atomic.AtomicLong pathfindRaceSkipped = new java.util.concurrent.atomic.AtomicLong();
+   private static final java.util.concurrent.atomic.AtomicLong pathfindRaceEscaped = new java.util.concurrent.atomic.AtomicLong();
    private static final java.util.concurrent.atomic.AtomicLong surfacePropertyRaceSkipped = new java.util.concurrent.atomic.AtomicLong();
 
    /**
@@ -1127,18 +1167,33 @@ public final class UpdateBatch {
    }
 
    /**
-    * A worker mid-batch hit the PathFindBehavior2 race (the async pathfinder's list write or the position-derived
-    * IllegalStateException) and the override returned {@code BehaviorResult.Working} for this frame instead of
-    * letting the throw latch the batch off; the character retries next frame. Count only — the interesting stack
-    * is already known and documented; the count is on {@link #describe}.
+    * A batch task's {@code PathFindBehavior2.update()} threw {@code IndexOutOfBounds} or
+    * {@code IllegalStateException}. This used to be swallowed into {@code BehaviorResult.Working}, on the reading
+    * that PZ's pathfinder writes the character's path list from its own thread — it does not: both pathfinders
+    * fill the REQUEST's own Path and the only code that copies a result into a character is
+    * {@code PathFindBehavior2.Succeeded}, called from {@code PolygonalMap2.updateMain} /
+    * {@code PathfindNative.updateMain}, on the game thread, from {@code IngameState.UpdateStuff}, which runs after
+    * {@code IsoWorld.update()} has returned and the flight has landed. The real race was the class's four static
+    * scratch objects, now per-thread ({@link #pathPointScratch} and friends), which closes the silent
+    * wrong-index/wrong-vector case as well as the throwing one.
+    *
+    * <p>So this is an assertion now, not a catch: it counts, the first one logs the whole stack, and the
+    * exception is rethrown, which is vanilla's behaviour on and off a batch alike. A nonzero
+    * {@code pathfindRaceEscaped} on {@link #describe} means that reading is wrong somewhere and the log says
+    * where. Only a batch task counts — vanilla's own throw shape (an empty path with the finder reporting found)
+    * is not a race.
     */
-   public static void onPathfindRaceSkipped() {
-      pathfindRaceSkipped.incrementAndGet();
+   public static void onPathfindRaceEscaped(Throwable e) {
+      if (pathfindRaceEscaped.incrementAndGet() == 1L) {
+         Log.warn("entityUpdateParallel: PathFindBehavior2.update threw on a batch task, which the per-thread"
+               + " scratch was supposed to make impossible, so the path race is NOT closed; stack follows: "
+               + stackOf(e));
+      }
    }
 
-   /** How many PathFindBehavior2 updates a worker skipped to Working on the race this session. */
-   public static long getPathfindRaceSkippedCount() {
-      return pathfindRaceSkipped.get();
+   /** How many batch tasks threw out of PathFindBehavior2.update this session. Zero is the expected reading. */
+   public static long getPathfindRaceEscapedCount() {
+      return pathfindRaceEscaped.get();
    }
 
    /**
@@ -1169,7 +1224,7 @@ public final class UpdateBatch {
             + " emitterDeferred=" + emitterDeferred + " emitterDrained=" + emitterDrained
             + " ballisticsDeferred=" + ballisticsDeferred + " ballisticsDrained=" + ballisticsDrained
             + " ragdollDeferred=" + ragdollDeferred + " ragdollDrained=" + ragdollDrained
-            + " luaSuppressed=" + luaSuppressed.get() + " pathfindRaceSkipped=" + pathfindRaceSkipped.get()
+            + " luaSuppressed=" + luaSuppressed.get() + " pathfindRaceEscaped=" + pathfindRaceEscaped.get()
             + " surfacePropertyRaceSkipped=" + surfacePropertyRaceSkipped.get()
             + " movingSquareDeferred=" + movingSquareDeferred
             + " combinedFrames=" + combinedFrames + " inlineQueued=" + inlineQueued

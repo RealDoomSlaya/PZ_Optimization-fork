@@ -234,7 +234,7 @@ implements IPathfinder {
         this.goal = Goal.Character;
         this.goalCharacter = target;
         if (target.getVehicle() != null) {
-            Vector3f v = target.getVehicle().chooseBestAttackPosition(target, this.chr, tempVector3f_1);
+            Vector3f v = target.getVehicle().chooseBestAttackPosition(target, this.chr, pzopt.UpdateBatch.pathScratch3()); // pzopt: entityUpdateParallel, this thread's tempVector3f_1 — WalkTowardState calls this from every chasing zombie's update, so batch tasks shared the static
             if (v != null) {
                 this.setData(v.x, v.y, PZMath.fastfloor((float)target.getVehicle().getZ()));
                 return;
@@ -777,16 +777,29 @@ implements IPathfinder {
     }
 
     public BehaviorResult update() {
-        // pzopt: entityUpdateParallel. Layer 1 of PZMulticore's PathFindBehavior2 port: PZ's async pathfinding
-        // writes this.path.nodes from its own thread while a batch task runs this method, so on any batch task
-        // — a worker or the game thread working the batch (onBatchTaskNow; every live escape was the game-thread
-        // participant) — the method iterates a frozen copy taken once here; every read below goes through this
-        // local. Outside a batch the local IS the live list (no clone), so serial behaviour is bit-identical.
-        ArrayList<PathNode> nodes = this.path.nodes; // pzopt: entityUpdateParallel, the method's only direct read
-        if (nodes != null && pzopt.UpdateBatch.onBatchTaskNow()) { // pzopt: entityUpdateParallel
-            nodes = (ArrayList<PathNode>)nodes.clone(); // pzopt: entityUpdateParallel
-        } // pzopt: entityUpdateParallel
-        try { // pzopt: entityUpdateParallel. Layer 2: the catch at the bottom of the method.
+        // pzopt: entityUpdateParallel. This method used to open with a defensive clone of this.path.nodes, on the
+        // reading that PZ's pathfinding writes the list from its own thread while a batch task reads it. It does
+        // not. Both pathfinders fill the REQUEST's own Path and queue the request; the only code that copies a
+        // result into a character is Succeeded, whose only callers are PolygonalMap2.updateMain and
+        // PathfindNative.updateMain, both on the game thread from IngameState.UpdateStuff, which updateInternal
+        // reaches only after IsoWorld.update() has returned and the scheduler's finally has joined the flight.
+        // this.path is private, so nothing outside this class can touch the list at all. The clone guarded a
+        // writer that does not exist in the window and cost one ArrayList copy per batched zombie per frame, so
+        // it is gone and every read below is the live list again, as stock.
+        //
+        // What did race is the four STATIC scratch objects this class shares between every thread running these
+        // methods; each one is a per-thread object now (pathScratch/pathScratch2/pathScratch3/pathPointScratch).
+        // The sharp one is pointOnPath, two lines below: closestPointOnPath writes it and the next statement
+        // reads pathIndex back, so a second task landing in between handed this character an index derived from
+        // ANOTHER character's path — out of range it threw (the counted escapes), in range it silently walked the
+        // wrong segment. Each local below deliberately SHADOWS the static field of the same name, so every
+        // unqualified use in the body reads this thread's object with no other change to the method; the
+        // PathFindBehavior2.-qualified uses are rewritten one by one, and PathfindRaceGuardTest pins in bytecode
+        // that no read of any of the four statics is left here, which is what makes a missed one a build failure.
+        PointOnPath pointOnPath = pzopt.UpdateBatch.pathPointScratch(); // pzopt: entityUpdateParallel, shadows the static
+        Vector2 tempVector2 = pzopt.UpdateBatch.pathScratch(); // pzopt: entityUpdateParallel, shadows the static
+        Vector2 tempVector2_2 = pzopt.UpdateBatch.pathScratch2(); // pzopt: entityUpdateParallel, shadows the static
+        try { // pzopt: entityUpdateParallel, the assertion at the bottom of the method
         if (this.chr.getFinder().progress == AStarPathFinder.PathFindProgress.notrunning) {
             if (PathfindNative.useNativeCode) {
                 PathFindRequest request = PathfindNative.instance.addRequest((IPathfinder)this, (Mover)this.chr, this.startX, this.startY, this.startZ, this.targetX, this.targetY, this.targetZ);
@@ -821,7 +834,7 @@ implements IPathfinder {
             IsoGameCharacter isoGameCharacter;
             if (GameClient.client && (isoGameCharacter = this.chr) instanceof IsoPlayer && !(isoPlayer = (IsoPlayer)isoGameCharacter).isLocalPlayer()) {
                 this.chr.getDeferredMovement(tempVector2_2);
-                this.chr.moveUnmodded(PathFindBehavior2.tempVector2_2.x, PathFindBehavior2.tempVector2_2.y);
+                this.chr.moveUnmodded(tempVector2_2.x, tempVector2_2.y); // pzopt: entityUpdateParallel, the shadowing local
             }
             return BehaviorResult.Working;
         }
@@ -835,7 +848,7 @@ implements IPathfinder {
         this.chr.setPath2(this.path);
         IsoZombie zombie = (IsoZombie)Type.tryCastTo((Object)this.chr, IsoZombie.class);
         if (this.goal == Goal.Character && zombie != null && this.goalCharacter != null && this.goalCharacter.getVehicle() != null && this.chr.DistToSquared(this.targetX, this.targetY) < 16.0f) {
-            Vector3f v = this.goalCharacter.getVehicle().chooseBestAttackPosition(this.goalCharacter, this.chr, tempVector3f_1);
+            Vector3f v = this.goalCharacter.getVehicle().chooseBestAttackPosition(this.goalCharacter, this.chr, pzopt.UpdateBatch.pathScratch3()); // pzopt: entityUpdateParallel, this thread's tempVector3f_1
             if (v == null) {
                 return BehaviorResult.Failed;
             }
@@ -861,9 +874,9 @@ implements IPathfinder {
             }
         }
         PathFindBehavior2.closestPointOnPath(this.chr.getX(), this.chr.getY(), this.chr.getZ(), (IsoMovingObject)this.chr, this.path, pointOnPath);
-        this.pathIndex = PathFindBehavior2.pointOnPath.pathIndex;
-        if (this.pathIndex == nodes.size() - 2) { // pzopt: entityUpdateParallel, the snapshot local
-            PathNode node = nodes.get(nodes.size() - 1); // pzopt: entityUpdateParallel, the snapshot local
+        this.pathIndex = pointOnPath.pathIndex; // pzopt: entityUpdateParallel, the shadowing local — an index this thread just derived from its OWN path
+        if (this.pathIndex == this.path.nodes.size() - 2) {
+            PathNode node = this.path.nodes.get(this.path.nodes.size() - 1);
             float distToEnd = IsoUtils.DistanceTo((float)this.chr.getX(), (float)this.chr.getY(), (float)node.x, (float)node.y);
             if (distToEnd <= 0.05f) {
                 this.chr.getDeferredMovement(tempVector2);
@@ -879,7 +892,7 @@ implements IPathfinder {
                     }
                     tempVector2_2.set(node.x - this.chr.getX(), node.y - this.chr.getY());
                     tempVector2_2.setLength(PZMath.min((float)distToEnd, (float)(0.005f * GameTime.getInstance().getMultiplier())));
-                    this.chr.moveUnmodded(PathFindBehavior2.tempVector2_2.x, PathFindBehavior2.tempVector2_2.y);
+                    this.chr.moveUnmodded(tempVector2_2.x, tempVector2_2.y); // pzopt: entityUpdateParallel, the shadowing local
                     this.stopping = true;
                     return BehaviorResult.Working;
                 }
@@ -887,11 +900,11 @@ implements IPathfinder {
                 return BehaviorResult.Succeeded;
             }
             this.stopping = false;
-        } else if (this.pathIndex < nodes.size() - 2 && PathFindBehavior2.pointOnPath.dist > 0.999f) { // pzopt: entityUpdateParallel, the snapshot local
+        } else if (this.pathIndex < this.path.nodes.size() - 2 && pointOnPath.dist > 0.999f) { // pzopt: entityUpdateParallel, the shadowing local
             ++this.pathIndex;
         }
-        PathNode v1 = nodes.get(this.pathIndex); // pzopt: entityUpdateParallel, the snapshot local
-        PathNode v2 = nodes.get(this.pathIndex + 1); // pzopt: entityUpdateParallel, the snapshot local
+        PathNode v1 = this.path.nodes.get(this.pathIndex);
+        PathNode v2 = this.path.nodes.get(this.pathIndex + 1);
         this.pathNextX = v2.x;
         this.pathNextY = v2.y;
         this.pathNextIsSet = true;
@@ -938,7 +951,7 @@ implements IPathfinder {
         if (this.shouldBeMoving()) {
             tempVector2_2.set(dir);
             tempVector2_2.setLength(speed);
-            this.chr.moveUnmodded(PathFindBehavior2.tempVector2_2.x, PathFindBehavior2.tempVector2_2.y);
+            this.chr.moveUnmodded(tempVector2_2.x, tempVector2_2.y); // pzopt: entityUpdateParallel, the shadowing local — this is the step another zombie's vector used to take
             this.startedMoving = true;
         }
         if (this.isStrafing()) {
@@ -953,7 +966,7 @@ implements IPathfinder {
                 if (tempVector2.getLengthSquared() > 0.0f) {
                     this.chr.DirectionFromVector(tempVector2);
                     tempVector2.normalize();
-                    this.chr.setForwardDirection(PathFindBehavior2.tempVector2.x, PathFindBehavior2.tempVector2.y);
+                    this.chr.setForwardDirection(tempVector2.x, tempVector2.y); // pzopt: entityUpdateParallel, the shadowing local — the getLengthSquared guard above now covers the same object this reads
                     AnimationPlayer animationPlayer = this.chr.getAnimationPlayer();
                     if (animationPlayer != null && animationPlayer.isReady()) {
                         animationPlayer.updateForwardDirection(this.chr);
@@ -964,16 +977,19 @@ implements IPathfinder {
             }
         }
         return BehaviorResult.Working;
-        // pzopt: entityUpdateParallel. Layer 2 of the PZMulticore port: the snapshot removes the list race, but a
-        // torn position read can still surface as an IllegalStateException (a zero-length vector past the
-        // ForwardDirection guard's own method) or an IndexOutOfBoundsException (pathIndex derived from the live
-        // path against the snapshot, or a list read inside a callee such as closestPointOnPath). On any batch
-        // task — worker or game-thread participant, the same writers race both — the character just retries
-        // next frame: count it and report Working. Outside a batch the throw escapes — vanilla parity.
+        // pzopt: entityUpdateParallel. This used to swallow the throw into BehaviorResult.Working on a batch task
+        // and count it, which hid the disease instead of curing it: the throws came from the shared pointOnPath
+        // and the shared vectors above, and for every one of them an unknown number of reads landed in range and
+        // walked the wrong segment in silence. With the four scratch objects per-thread there is no cross-thread
+        // writer left on this path, so nothing here should be able to fire for a concurrency reason. It is an
+        // assertion now, not a guard: a batch task's throw is counted and the first one logs its whole stack, and
+        // the exception is rethrown on every thread, which is exactly vanilla's behaviour (an empty path with the
+        // finder reporting found throws in stock too, and must keep throwing). Off a batch nothing is counted,
+        // because that throw is vanilla's own and not a race. pathfindRaceEscaped=0 in a route log is the reading
+        // holding; anything else says it does not, and says where.
         } catch (IndexOutOfBoundsException | IllegalStateException e) { // pzopt: entityUpdateParallel
             if (pzopt.UpdateBatch.onBatchTaskNow()) { // pzopt: entityUpdateParallel
-                pzopt.UpdateBatch.onPathfindRaceSkipped(); // pzopt: entityUpdateParallel
-                return BehaviorResult.Working; // pzopt: entityUpdateParallel
+                pzopt.UpdateBatch.onPathfindRaceEscaped(e); // pzopt: entityUpdateParallel
             } // pzopt: entityUpdateParallel
             throw e; // pzopt: entityUpdateParallel
         } // pzopt: entityUpdateParallel
@@ -991,6 +1007,10 @@ implements IPathfinder {
             return;
         }
         IsoZombie zombie = (IsoZombie)Type.tryCastTo((Object)this.chr, IsoZombie.class);
+        // pzopt: entityUpdateParallel. Reached from update() through updateWhileRunningPathfind and from the walk
+        // states, so a batch task runs it: the two locals shadow the statics of the same name (see update()).
+        Vector2 tempVector2 = pzopt.UpdateBatch.pathScratch(); // pzopt: entityUpdateParallel, shadows the static
+        Vector2 tempVector2_2 = pzopt.UpdateBatch.pathScratch2(); // pzopt: entityUpdateParallel, shadows the static
         Vector2 dir = tempVector2.set(x - this.chr.getX(), y - this.chr.getY());
         if (PZMath.fastfloor((float)x) == PZMath.fastfloor((float)this.chr.getX()) && PZMath.fastfloor((float)y) == PZMath.fastfloor((float)this.chr.getY()) && dir.getLength() <= 0.1f) {
             return;
@@ -1009,7 +1029,7 @@ implements IPathfinder {
         }
         tempVector2_2.set(dir);
         tempVector2_2.setLength(speed);
-        this.chr.moveUnmodded(PathFindBehavior2.tempVector2_2.x, PathFindBehavior2.tempVector2_2.y);
+        this.chr.moveUnmodded(tempVector2_2.x, tempVector2_2.y); // pzopt: entityUpdateParallel, the shadowing local
         if (isRemoteZombieWithTarget) {
             return;
         }
@@ -1019,6 +1039,10 @@ implements IPathfinder {
     }
 
     public void moveToDir(IsoMovingObject target, float speedMul) {
+        // pzopt: entityUpdateParallel. The lunge and bumped states reach this from a batched zombie's update, so
+        // the two locals shadow the statics of the same name (see update()).
+        Vector2 tempVector2 = pzopt.UpdateBatch.pathScratch(); // pzopt: entityUpdateParallel, shadows the static
+        Vector2 tempVector2_2 = pzopt.UpdateBatch.pathScratch2(); // pzopt: entityUpdateParallel, shadows the static
         Vector2 dir = tempVector2.set(target.getX() - this.chr.getX(), target.getY() - this.chr.getY());
         if (dir.getLength() <= 0.1f) {
             return;
@@ -1040,7 +1064,7 @@ implements IPathfinder {
         }
         tempVector2_2.set(dir);
         tempVector2_2.setLength(speed);
-        this.chr.moveUnmodded(PathFindBehavior2.tempVector2_2.x, PathFindBehavior2.tempVector2_2.y);
+        this.chr.moveUnmodded(tempVector2_2.x, tempVector2_2.y); // pzopt: entityUpdateParallel, the shadowing local
         this.chr.faceLocation(target.getX() - 0.5f, target.getY() - 0.5f);
         this.chr.setForwardDirection(target.getX() - this.chr.getX(), target.getY() - this.chr.getY());
         this.chr.getForwardDirection().normalize();
@@ -1193,8 +1217,12 @@ implements IPathfinder {
             if (zombie.getStateMachine().getPrevious() == ZombieGetDownState.instance() && ZombieGetDownState.instance().isNearStartXY((IsoGameCharacter)zombie)) {
                 return;
             }
+            // pzopt: entityUpdateParallel. update() calls this per crawling zombie, so this advanceAlongPath and
+            // the read under it are a batch task's: this thread's PointOnPath, not the shared static. On one
+            // thread it is the same object update() already used, exactly as the static was.
+            PointOnPath pointOnPath = pzopt.UpdateBatch.pathPointScratch(); // pzopt: entityUpdateParallel, shadows the static
             this.advanceAlongPath(this.chr.getX(), this.chr.getY(), this.chr.getZ(), 0.5f, pointOnPath);
-            if (!PolygonalMap2.instance.canStandAt(PathFindBehavior2.pointOnPath.x, PathFindBehavior2.pointOnPath.y, PZMath.fastfloor((float)zombie.getZ()), null, false, true)) {
+            if (!PolygonalMap2.instance.canStandAt(pointOnPath.x, pointOnPath.y, PZMath.fastfloor((float)zombie.getZ()), null, false, true)) { // pzopt: entityUpdateParallel, the shadowing local
                 return;
             }
             if (!v2.hasFlag(1) && PolygonalMap2.instance.canStandAt(zombie.getX(), zombie.getY(), PZMath.fastfloor((float)zombie.getZ()), null, false, true)) {
