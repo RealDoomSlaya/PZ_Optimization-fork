@@ -30,10 +30,13 @@ die() { echo "error: $*" >&2; exit 1; }
 check_classpath() {
   [[ -f "$LAUNCHER_JSON" ]] || die "launcher config not found: $LAUNCHER_JSON"
   local cp
+  # tr -d '\r': a Windows python writes CRLF, which left every entry as ".\r" and matched neither the "."
+  # test nor the jar's, so install refused on a launcher JSON that was in fact correct ("classpath does not
+  # put \".\" ahead of projectzomboid.jar", printing a classpath that looked right because the CR is invisible).
   cp=$(python3 -c '
 import json,sys
 d=json.load(open(sys.argv[1]))
-print("\n".join(d.get("classpath",[])))' "$LAUNCHER_JSON") || die "could not parse $LAUNCHER_JSON"
+print("\n".join(d.get("classpath",[])))' "$LAUNCHER_JSON" | tr -d '\r') || die "could not parse $LAUNCHER_JSON"
   local dot jar n=0
   dot=""; jar=""
   while IFS= read -r e; do
