@@ -475,11 +475,15 @@ copy the classes next to `projectzomboid.jar` (on macOS that is
 ### Method A: Steam Workshop
 
 Subscribe to [PZ_Optimization on the Workshop](https://steamcommunity.com/sharedfiles/filedetails/?id=3805285544)
-and let Steam download it. **Enabling it in the game's Mods list does nothing**: the
-Workshop cannot write into the game folder, so the item only carries the files and the
-installer, and one command finishes the install. Close the game, then:
+and let Steam download it. The Workshop cannot write into the game folder, so the item
+carries the files and the installer, and one command finishes the install.
 
-**Windows** (PowerShell; adjust the drive if your Steam library is elsewhere):
+**Easiest:** enable the mod once in the game's Mods list. The main menu then shows the install
+command for your computer, with the item's real folder in it and a **Copy** button: paste it into
+PowerShell or a terminal, then quit the game (the installer waits for that). Start the game again
+and disable the mod: it only carries that window.
+
+**By hand** (Windows, PowerShell; adjust the drive if your Steam library is elsewhere):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File "C:\Program Files (x86)\Steam\steamapps\workshop\content\108600\3805285544\mods\PZ_Optimization\42\install.ps1"
@@ -498,29 +502,31 @@ bash ~/Library/Application\ Support/Steam/steamapps/workshop/content/108600/3805
 ```
 
 The script finds the unpacked `pzopt-classes/` folder next to itself and installs from it,
-no download. Updates arrive through the Workshop; run the same command again after an update
-(`-Uninstall` / `--uninstall` first if the status says a file changed). Item layout and
-upload procedure: [`docs/workshop.md`](docs/workshop.md).
+no download. Updates: the main menu's UPDATE PZ OPTIMIZATION item copies a newer Workshop
+download over the installed files, no installer run needed. Item layout and upload procedure:
+[`docs/workshop.md`](docs/workshop.md).
 
 ### Method B: installer script from the GitHub release
 
-The script downloads `pzopt-<revision>-classes.zip` for your game's revision from the
-matching release and installs it.
+One line, no path to type. The script uses the Steam Workshop copy when it finds one in the
+Steam library that holds the game; otherwise it downloads `pzopt-<revision>-classes.zip` for
+your game's revision from the matching release. A running game is waited for.
 
 **Windows** (Start menu, type `powershell`):
 
 ```powershell
-Invoke-WebRequest https://github.com/xD3I/PZ_Optimization/releases/latest/download/install.ps1 -OutFile "$env:USERPROFILE\Downloads\install.ps1"
-powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\Downloads\install.ps1"
+irm https://github.com/xD3I/PZ_Optimization/releases/latest/download/install.ps1 | iex
 ```
 
 **Linux and macOS** (Terminal):
 
 ```sh
-curl -fsSLO https://github.com/xD3I/PZ_Optimization/releases/latest/download/install.sh
-chmod +x install.sh
-./install.sh
+curl -fsSL https://github.com/xD3I/PZ_Optimization/releases/latest/download/install.sh | bash
 ```
+
+Options go after the script: `& ([scriptblock]::Create((irm <url>))) -Status` on Windows,
+`curl -fsSL <url> | bash -s -- --status` on Linux and macOS. Or download the file and run it
+(`powershell -ExecutionPolicy Bypass -File install.ps1`, `bash install.sh`).
 
 On macOS the script finds `Project Zomboid.app` through Steam's library list and installs
 into its `Contents/Java`; the bundle's launcher already searches that folder before the jar,
@@ -594,18 +600,26 @@ grep -c '\[pzopt\] loaded override' ~/Zomboid/console.txt
 
 ### Uninstall
 
-Close the game. The jar was never modified, so no Steam file verification is needed.
+**In the game:** Options > Optimizations > **Uninstall PZ Optimization...** (main menu). The
+game closes; once it has, a helper removes every file the installer or the updater recorded,
+the DLSS files the Enhancements tab fetched and the AOT cache, and the launcher settings it
+changed are put back (log: `Zomboid/pzopt/uninstall.log`). Do this before unsubscribing from
+the Workshop item: unsubscribing deletes the item, not the installed files.
+
+**From a terminal** (the game may be running; the script waits for it to close):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall      # Windows (release or Workshop copy of the script)
+& ([scriptblock]::Create((irm https://github.com/xD3I/PZ_Optimization/releases/latest/download/install.ps1))) -Uninstall
 ```
 
 ```sh
-./install.sh --uninstall        # Linux / macOS, release or Workshop install
+curl -fsSL https://github.com/xD3I/PZ_Optimization/releases/latest/download/install.sh | bash -s -- --uninstall
 scripts/pzopt.sh uninstall      # Linux, from-source install
 ```
 
-Each removes exactly the files it recorded and the empty folders they leave. The caches and
+A local copy works the same (`install.ps1 -Uninstall`, `install.sh --uninstall`, the Workshop
+item's `install.bash --uninstall`). The jar was never modified, so no Steam file verification
+is needed. Each removes exactly the files it recorded and the empty folders they leave. The caches and
 settings under `Zomboid/pzopt/` (`options.ini`, `framecap.ini`, `anims/`, `packs/`) can be
 deleted by hand; without the overrides the game uses whatever its own `options.ini` holds.
 

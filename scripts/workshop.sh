@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Stage the Steam Workshop item (pure distribution, BetterFPS-style): the release zip
 # unpacked under a mod folder plus the two installers, so Steam downloads the files and the
-# player runs the installer (or copies the tree by hand). The game never loads anything from
-# the item: there is no media/ folder, only mod.info so it shows up in the mod list with the
-# instructions.
+# player runs the installer (or copies the tree by hand). The game loads nothing of the
+# optimizations from the item; its only media/ file is the install helper
+# (src/workshop/42/media/lua/client/): enabled in the Mods list, it shows the install command for
+# that computer with a Copy button at the main menu.
 #
 #   scripts/workshop.sh                       # scripts/release.sh (build + test + zip), then stage
 #   scripts/workshop.sh --tag win-b0bbce05d5-cc99c05   # stage the asset of that GitHub release (exact mirror)
@@ -75,15 +76,24 @@ cp install.ps1 "$MOD/install.ps1"
 cp install.sh "$MOD/install.bash"
 chmod +x "$MOD/install.bash"
 
-# mod.info: id, name, description lines (<LINE> is the in-game line break); no media/
+# the install helper, the item's only Lua (the pzopt Lua files under pzopt-classes/ reach the game with the classes)
+cp -r src/workshop/42/. "$MOD/"
+
+# mod.info: id, name, description lines (<LINE> is the in-game line break)
 {
   echo "name=PZ_Optimization (class overrides, manual install)"
   echo "id=PZ_Optimization"
   echo "modversion=${commit:-$rev}"
   echo "versionMin=${version:-42.20.0}"
   echo "author=xD3I"
+  # the Mods screen draws poster 0 next to the description and the rest as thumbnails (hover = large): the three
+  # steps first, then the five walkthrough pictures (harness/install-walkthrough.py --posters, src/workshop/42/),
+  # then the showcase square
+  for p in poster-install.png poster-step1.png poster-step2.png poster-step3.png poster-step4.png poster-step5.png; do
+    [[ -f "$MOD/$p" ]] && echo "poster=$p"
+  done
   echo "poster=poster.png"
-  echo "description=Not a Lua mod: enabling it here does nothing. <LINE> Run install.ps1 (Windows) or install.bash (Linux) from this item's folder under steamapps/workshop/content/108600/, then launch the game. <LINE> Built for game revision $rev${version:+ (Build $version)}. Source and releases: github.com/xD3I/PZ_Optimization"
+  echo "description=Class files for the game folder, not a Lua mod: enable this mod once and the main menu shows the install command for your computer with a Copy button; after installing, disable it again. <LINE> Or run install.ps1 (Windows) or install.bash (Linux, macOS) from this item's folder under steamapps/workshop/content/108600/. <LINE> To remove it: Options > Optimizations > Uninstall PZ Optimization, before you unsubscribe. <LINE> Built for game revision $rev${version:+ (Build $version)}. Source and releases: github.com/xD3I/PZ_Optimization"
 } > "$MOD/mod.info"
 
 # images: preview.png for the Workshop page (square, <= 1 MB), poster.png for the mod list

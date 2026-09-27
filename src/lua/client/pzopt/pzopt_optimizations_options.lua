@@ -755,6 +755,30 @@ local ENHANCEMENT_SECTIONS = {
         },
     },
     {
+        title = "God rays (light shafts through windows, doorways, trees and fog)", clip = "hdr",
+        entries = {
+            { key = "godRays", label = "God rays",
+              tip = "Sunlight (and moonlight) falls through windows and open doorways into rooms as shafts of light in the dust, with sunlit patches on the floor, tables and walls where it lands, cut exactly by the window frames; outdoors, in fog, rain and morning mist, the shadows of buildings and trees stretch through the haze; torches, headlights and lamps glow in the dust and fog around them. Walls, roofs, upper floors, curtains and barricades block the light; tree crowns let it through their gaps. Nothing is drawn where no light comes in: a clear day costs only the rooms with sunlit windows on screen (one draw), the haze pass runs only in fog, rain or mist. Windows and Linux (not on macOS, OpenGL 2.1)." },
+            { key = "godRaysStrengthPct", label = "God rays: brightness (%)",
+              choices = { "50", "75", "100", "150", "200" }, note = { ["100"] = "default" },
+              tip = "How bright the shafts of light and the sunlit patches are." },
+            { key = "godRaysDustPct", label = "God rays: dust in rooms (%)",
+              choices = { "0", "50", "100", "200" }, note = { ["100"] = "default", ["0"] = "patches only" },
+              tip = "How dusty the air in rooms is: the more dust, the brighter the shafts through the windows (0: only the sunlit patches)." },
+            { key = "godRaysPatchPct", label = "God rays: sunlit patches (%)",
+              choices = { "0", "50", "100", "150" }, note = { ["100"] = "default" },
+              tip = "How bright the sun lands on the floor, furniture and walls where a shaft reaches them (0: the shafts only)." },
+            { key = "godRaysHazePct", label = "God rays: haze outdoors (%)",
+              choices = { "0", "50", "100", "200" }, note = { ["100"] = "default", ["0"] = "off" },
+              tip = "How hazy the open air is: fog, rain and the mist of the hours after sunrise add to it, and the shadows of buildings and trees stretch through it as rays. A clear midday has almost none (and costs nothing)." },
+            { key = "godRaysLocal", label = "God rays: torches, headlights and lamps",
+              tip = "Torch beams, headlights, street lamps and fires glow in the dust of rooms and in fog and rain, their cones shaped by the light's reach and direction." },
+            { key = "godRaysLocalPct", label = "God rays: torch and lamp glow (%)",
+              choices = { "50", "100", "200" }, note = { ["100"] = "default" },
+              tip = "How strong the glow around torches, headlights and lamps is." },
+        },
+    },
+    {
         title = "Darkness, remembered places and colour grading", clip = "darkness",
         entries = {
             { key = "darknessFloorPct", label = "Darkness floor (% of full light)",
@@ -1243,6 +1267,8 @@ local EFFECTS = {
     sunShadows = { gpu = 1, vram = 1 },
     cloudShadows = { gpu = 1 },
     reflections = { gpu = 1, vram = 1 },
+    godRays = { gpu = 1, vram = 1 },
+    godRaysLocal = { gpu = 1 },
     darknessFloorPct = {},
     memoryTint = {},
     colorGrading = { gpu = -1 },
@@ -2605,6 +2631,135 @@ local function applyProfile(self, profile)
     end
 end
 
+-- "Uninstall PZ Optimization": pzopt.Uninstall puts the launcher settings back now and starts a helper that deletes the
+-- installed files once the game has quit (the classes cannot go while it runs), then the game quits the stock way.
+-- Main menu only: in a world the quit would skip the save.
+local UNINSTALL_TITLE = "Uninstall PZ Optimization..."
+local UNINSTALL_TIP = "Closes the game, then removes every file the installer or the updater put into the game folder and puts "
+    .. "back the launcher settings it changed: the next launch is the stock game. projectzomboid.jar was never modified. "
+    .. "Your settings under Zomboid/pzopt/ stay for a reinstall. Do this before you unsubscribe from the Workshop item."
+-- ISModalDialog draws plain text: lines broken by hand ("\n"), no rich-text tags
+local UNINSTALL_CONFIRM = "Uninstall PZ Optimization?\n\n"
+    .. "The game closes now. Once it has, every file the installer\n"
+    .. "or the updater put into the game folder is removed and the\n"
+    .. "launcher settings it changed are put back: the next launch\n"
+    .. "is the stock game. Your settings in Zomboid/pzopt/ stay.\n\n"
+    .. "Afterwards you can unsubscribe from the Workshop item."
+
+local function showUninstallResult(text)
+    local modal = ISModalDialog:new(getCore():getScreenWidth() / 2 - 200, getCore():getScreenHeight() / 2 - 60, 400, 120,
+        text, false, nil, nil)
+    modal:initialise()
+    modal:setCapture(true)
+    modal:setAlwaysOnTop(true)
+    modal:addToUIManager()
+end
+
+local function onUninstallConfirm(target, button)
+    if button.internal ~= "YES" then return end
+    local ok, started = pcall(function() return perf():pzoptUninstall() end)
+    if ok and started then
+        MainScreen.instance:quitToDesktop()
+        return
+    end
+    local msg = ""
+    pcall(function() msg = perf():getPzoptUninstallMessage() end)
+    showUninstallResult("Nothing was removed:\n" .. tostring(msg):gsub(": ", ":\n"))
+end
+
+local function addUninstallButton(self, splitpoint, y)
+    local b = self:addButton(splitpoint, y, UNINSTALL_TITLE)
+    b.target = self
+    b.onclick = function()
+        if MainScreen.instance and MainScreen.instance.inGame then return end
+        local w, h = 420, 200
+        local modal = ISModalDialog:new(getCore():getScreenWidth() / 2 - w / 2, getCore():getScreenHeight() / 2 - h / 2, w, h,
+            UNINSTALL_CONFIRM, true, self, onUninstallConfirm)
+        modal:initialise()
+        modal:setCapture(true)
+        modal:setAlwaysOnTop(true)
+        modal:addToUIManager()
+        self.pzoptUninstallModal = modal
+        local joypadData = JoypadState.getMainMenuJoypad()
+        if joypadData then
+            modal.prevFocus = joypadData.focus
+            joypadData.focus = modal
+            updateJoypadFocus(joypadData)
+        end
+    end
+    self.pzoptUninstallButton = b
+    local why = ""
+    pcall(function() why = perf():getPzoptUninstallUnavailable() end)
+    if MainScreen.instance and MainScreen.instance.inGame then
+        why = "go back to the main menu first (quitting from a world would skip the save)"
+    end
+    if why ~= "" then
+        b:setEnable(false)
+        b.tooltip = UNINSTALL_TIP .. " Not available now: " .. why .. "."
+    else
+        b.tooltip = UNINSTALL_TIP
+    end
+    return b
+end
+
+-- devUninstallDrive (dev rig, Config key; harness/uninstall-e2e.sh): once the main menu is up, the real controls in
+-- order: Options, the Optimizations tab, Uninstall PZ Optimization..., Yes. Each step is logged ("[pzopt-e2e] ...") and
+-- held for a few seconds so the script can take a screenshot; Yes starts pzopt.Uninstall and quits the game.
+local uninstallDrive = { step = 0, at = 0 }
+local function uninstallDriveTick()
+    local d = uninstallDrive
+    if d.step < 0 then return end
+    if d.step == 0 then
+        local ok, v = pcall(function() return getPerformance():getPzoptOption("devUninstallDrive") end)
+        if not ok or v ~= "true" then d.step = -1; return end
+        d.step, d.at = 1, getTimestampMs() + 4000
+        return
+    end
+    if getTimestampMs() < d.at then return end
+    local ms = MainScreen.instance
+    if not ms or ms.inGame then return end
+    local mo = ms.mainOptions
+    if d.step == 1 then
+        if not ms.optionsOption then return end
+        MainScreen.onMenuItemMouseDownMainMenu(ms.optionsOption, 0, 0)
+        d.step, d.at = 2, getTimestampMs() + 1500
+    elseif d.step == 2 then
+        if not mo or not mo.tabs then return end
+        mo.tabs:activateView(TAB)
+        d.step, d.at = 3, getTimestampMs() + 1500
+    elseif d.step == 3 then
+        local b = mo and mo.pzoptUninstallButton
+        if not b then
+            print("[pzopt-e2e] uninstall drive: no Uninstall button on the " .. TAB .. " tab")
+            d.step = -1
+            return
+        end
+        print("[pzopt-e2e] tab shown: button \"" .. tostring(b.title) .. "\" enabled=" .. tostring(b.enable) .. " visible="
+            .. tostring(b:isReallyVisible()) .. " tooltip=" .. tostring(b.tooltip))
+        getCore():TakeFullScreenshot("pzopt-e2e-A-tab.png")
+        d.step, d.at = 4, getTimestampMs() + 3000
+    elseif d.step == 4 then
+        mo.pzoptUninstallButton.onclick()
+        d.step, d.at = 5, getTimestampMs() + 1500
+    elseif d.step == 5 then
+        local m = mo.pzoptUninstallModal
+        if not m then
+            print("[pzopt-e2e] uninstall drive: the button opened no dialog")
+            d.step = -1
+            return
+        end
+        print("[pzopt-e2e] dialog shown: " .. string.gsub(tostring(m.text), "\n", " | "))
+        getCore():TakeFullScreenshot("pzopt-e2e-A-dialog.png")
+        d.step, d.at = 6, getTimestampMs() + 3000
+    elseif d.step == 6 then
+        local m = mo.pzoptUninstallModal
+        d.step = -1
+        print("[pzopt-e2e] pressing Yes at " .. getTimestampMs())
+        m:onClick(m.yes)
+    end
+end
+Events.OnFETick.Add(function() pcall(uninstallDriveTick) end)
+
 local function addAllButtons(self, splitpoint, y)
     local on = self:addButton(splitpoint, y, "Enable all (recommended defaults)")
     on.tooltip = "Turns the master switch on and puts every setting below back to the build's default on this machine. " .. RESTART_NOTE
@@ -2622,6 +2777,7 @@ local function addAllButtons(self, splitpoint, y)
         b.onclick = function(target) applyProfile(target, profile) end
         table.insert(profileButtons, b)
     end
+    addUninstallButton(self, splitpoint, y)
     if self.pzoptMaster and not self.pzoptMaster.control.enable then
         on:setEnable(false)
         off:setEnable(false)
@@ -2726,7 +2882,7 @@ local function layout(self, comboWidth)
     end
     labelW = labelW + 8
     local controlW = comboWidth
-    for _, title in ipairs({ "Enable all (recommended defaults)", "Disable all (stock game)", PAGE_RESET }) do
+    for _, title in ipairs({ "Enable all (recommended defaults)", "Disable all (stock game)", PAGE_RESET, UNINSTALL_TITLE }) do
         controlW = math.max(controlW, getTextManager():MeasureStringX(UIFont.Small, title) + 24)
     end
     for _, title in pairs(DEPS_TITLES) do

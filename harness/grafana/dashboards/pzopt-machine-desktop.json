@@ -1611,7 +1611,7 @@
      "maxWidth": 360
     }
    },
-   "timeFrom": "10d",
+   "timeFrom": "11d",
    "hideTimeOverride": true,
    "id": 9,
    "gridPos": {
@@ -2427,7 +2427,7 @@
      "maxWidth": 360
     }
    },
-   "timeFrom": "10d",
+   "timeFrom": "11d",
    "hideTimeOverride": true,
    "id": 10,
    "gridPos": {
@@ -2972,7 +2972,7 @@
   {
    "type": "table",
    "title": "Runs",
-   "description": "Frame times in ms over the route window (pzopt-frames.out); CPU / GPU from sysmon, game thread from pzopt-threads.out. Click a run for its dashboard, 'previous' to compare with the last run of the same label.",
+   "description": "Frame times in ms over the route window (pzopt-frames.out); CPU / GPU from sysmon, game thread from pzopt-threads.out. Click a run for its dashboard, 'previous' to compare with the last run of the same label, 'video' for its recording (the cold-storage bucket gs://diegov-videos-coldline; harness/cold-store.py uploads and links them).",
    "datasource": {
     "type": "grafana-postgresql-datasource",
     "uid": "pzopt-pg"
@@ -2987,7 +2987,7 @@
      "rawQuery": true,
      "editorMode": "code",
      "format": "table",
-     "rawSql": "SELECT started, run, fps_mean AS fps, fps_1pct_low AS \"1% low\", p50_ms AS p50, p99_ms AS p99, p99_9_ms AS \"p99.9\", max_ms AS max,\n  over_33ms AS \">33ms\", jitter_ms AS jitter, cpu_pct AS \"CPU %\", busiest_core_pct AS \"busiest core %\", gpu_pct AS \"GPU %\",\n  game_thread_pct AS \"game thread %\", total_w AS \"W\", j_per_frame AS \"J/frame\", CASE\n  WHEN gpu_pct >= 90 THEN 'GPU-bound'\n  WHEN game_thread_pct >= 90 OR game_load_pct >= 90 THEN 'game thread'\n  WHEN fps_mean >= 235 AND props NOT LIKE '%uncappedFps=true%' THEN 'at 240 cap'\n  WHEN fps_mean IS NULL THEN NULL\n  ELSE 'headroom left' END AS bound, verdict, round(verdict_confidence::numeric, 2) AS conf, valid,\n  variant, machine, mode, preset, chunk_p99_ms AS \"chunk p99\", gc_events AS gc, zoom, resolution, label,\n  lag(run) OVER (PARTITION BY label ORDER BY started) AS previous\nFROM runs WHERE $__timeFilter(started) AND machine IN (${machine:sqlstring}) AND coalesce(mode, '') IN (${mode:sqlstring}) AND label ~ ${label:sqlstring} ORDER BY started DESC",
+     "rawSql": "SELECT started, run, CASE WHEN v.url IS NOT NULL THEN 'video' END AS video, v.url AS video_url, fps_mean AS fps, fps_1pct_low AS \"1% low\", p50_ms AS p50, p99_ms AS p99, p99_9_ms AS \"p99.9\", max_ms AS max,\n  over_33ms AS \">33ms\", jitter_ms AS jitter, cpu_pct AS \"CPU %\", busiest_core_pct AS \"busiest core %\", gpu_pct AS \"GPU %\",\n  game_thread_pct AS \"game thread %\", total_w AS \"W\", j_per_frame AS \"J/frame\", CASE\n  WHEN gpu_pct >= 90 THEN 'GPU-bound'\n  WHEN game_thread_pct >= 90 OR game_load_pct >= 90 THEN 'game thread'\n  WHEN fps_mean >= 235 AND props NOT LIKE '%uncappedFps=true%' THEN 'at 240 cap'\n  WHEN fps_mean IS NULL THEN NULL\n  ELSE 'headroom left' END AS bound, verdict, round(verdict_confidence::numeric, 2) AS conf, valid,\n  variant, machine, mode, preset, chunk_p99_ms AS \"chunk p99\", gc_events AS gc, zoom, resolution, label,\n  lag(run) OVER (PARTITION BY label ORDER BY started) AS previous\nFROM runs LEFT JOIN run_videos v USING (run) WHERE $__timeFilter(started) AND machine IN (${machine:sqlstring}) AND coalesce(mode, '') IN (${mode:sqlstring}) AND label ~ ${label:sqlstring} ORDER BY started DESC",
      "hide": false
     }
    ],
@@ -3043,6 +3043,39 @@
        {
         "id": "custom.width",
         "value": 260
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "video"
+      },
+      "properties": [
+       {
+        "id": "links",
+        "value": [
+         {
+          "title": "The run's recording (cold storage)",
+          "url": "${__data.fields.video_url}"
+         }
+        ]
+       },
+       {
+        "id": "custom.width",
+        "value": 70
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "video_url"
+      },
+      "properties": [
+       {
+        "id": "custom.hidden",
+        "value": true
        }
       ]
      },

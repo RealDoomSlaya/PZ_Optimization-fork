@@ -888,6 +888,14 @@ Lua: "", "drive", "restarted:<ms>"). The install now goes through `pzopt.UpdateD
 changed zip entries only (range requests, prefetched in the background once offered), written
 beside their targets and renamed over them; unchanged files are not rewritten.
 
+In-game uninstall (2026-09-27): three forwards to `pzopt.Uninstall` for the Optimizations tab's
+"Uninstall PZ Optimization..." button: `getPzoptUninstallUnavailable()` ("" or why the button is
+off: a harness run, or no `pzopt-installed.txt` / `pzopt-files.txt` in the game folder),
+`pzoptUninstall()` (undoes AotCache's and GcChoice's launcher edits, writes the file list, starts
+a helper that deletes the files once this process has ended; the Lua then calls the stock
+`quitToDesktop`) and `getPzoptUninstallMessage()`. The button is off in a world (the quit would
+skip the save).
+
 Performance overlay item (added 2026-09-23): three forwards to `pzopt.Overlay`
 for `media/lua/client/pzopt/pzopt_mainscreen_overlay.lua`: `togglePzoptOverlay()`
 (`Overlay.toggle()`, the same path as the key binding, which now calls it too:
@@ -4912,3 +4920,33 @@ instead, and the bytecode pins cover the rest of the method. No performance numb
 a per-entity list copy and adds one thread-local read per scratch object per call, and the reason to make it is
 that the alternative leaves an unknown number of zombies a frame walking somebody else's path with no signal at
 all.
+
+## God rays (2026-09-27)
+
+Write-up: `docs/findings-god-rays-2026-09-27.md`. Class `pzopt.GodRays` (occupancy, the rectified froxel volume, light
+volumes, local lights, the haze's taps); `pzopt.FogPass` carries the fog shade.
+
+### zombie.core.opengl.ShaderUnit
+- The patch chain gets `GodRays.patchShader` innermost (the stock `screen.frag`: its bicubic fetch of the world picture is
+  wrapped, one tap of the quarter god ray buffer, before the colour grade's patch) and `GodRays.patchChunk` between the
+  cloud shadows' patch and the reflections': the chunk composite (`chunkShader.frag`, pixelLight's programs) adds the
+  outdoor haze from each fragment's own depth. The chunk patch only with `godRaysHazeComposite=chunk` (the default).
+
+### zombie.viewCone.ChunkRenderShader
+- `startRenderThread`: `GodRays.chunkDraw()` after the cloud shadows' uniforms: the haze uniforms once per program per
+  frame (off: the shader returns after one uniform test).
+
+### zombie.iso.fboRenderChunk.FBORenderCell
+- At a level's bake, when its objects were added, removed or changed and `godRays` is on: `GodRays.chunkChanged(chunk)`
+  (the occupancy of that chunk is rebuilt: a door opened, a window broken).
+- Before the chunk composite `GodRays.beforeComposite` (this frame's camera for the haze in the composite); before
+  `renderFog` `GodRays.queue` (this frame's light, volume updates, light volumes and local lights; the scene depth is
+  complete there).
+
+### zombie.iso.weather.WeatherShader
+- `startRenderThread`: `GodRays.worldUniforms(program)`: the quarter buffer and its mapping on the world composite (or its
+  switch off).
+
+### zombie.core.textures.MultiTextureFBO2
+- Around the screen composite `GodRays.screenBegin` / `screenEnd`: dev timing (`devGodRaysTiming`), and with
+  `godRaysLateDraw` (off) the light volumes and local lights drawn there over the finished world.

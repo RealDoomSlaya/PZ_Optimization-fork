@@ -1606,6 +1606,7 @@ public final class FBORenderCell {
       pzopt.PixelLight.beforeComposite(playerIndex, this.perPlayerData[playerIndex].onScreenChunks); // pzopt: pixelLight, the lattice uploads and the camera, ahead of the chunk composite that lights each pixel
       pzopt.SpriteFilter.beforeComposite(playerIndex); // pzopt: sprite filter, this frame's composite program for the zoom
       pzopt.CloudShadow.beforeComposite(playerIndex); // pzopt: cloudShadows, the drift and the camera of this frame, ahead of the chunk composite
+      pzopt.GodRays.beforeComposite(playerIndex); // pzopt: god rays, the camera of this frame for the haze in the chunk composite
       pzopt.GpuSections.begin(pzopt.SpriteFilter.section("composite")); /* pzopt: GPU section: chunk textures into the combined FBO and onto the screen */
       if (pzopt.Config.COMPOSITE_SHADER_RUN && pzopt.Overrides.enabled() && !DebugOptions.instance.fboRenderChunk.combinedFbo.getValue()
             && DebugOptions.instance.fboRenderChunk.renderChunkTextures.getValue()) { // pzopt: compositeShaderRun
@@ -1828,6 +1829,7 @@ public final class FBORenderCell {
       AbstractPerformanceProfileProbe var33 = fog.profile();
 
       try {
+         pzopt.GodRays.queue(playerIndex); // pzopt: god rays, this frame's light, volume updates and screen mapping (the scene depth is complete here)
          this.renderFog(playerIndex);
       } catch (Throwable var21) {
          if (var33 != null) {
@@ -2706,6 +2708,7 @@ public final class FBORenderCell {
                   this.pzoptBakeTrees(c, playerIndex, zoom);
                   pzopt.GpuSections.end("bake.trees"); // pzopt: GPU sub-section
                }
+               if (pzopt.Config.GOD_RAYS && renderLevels.isDirty(level, FBORenderChunk.DIRTY_OBJECT_ADD | FBORenderChunk.DIRTY_OBJECT_REMOVE | FBORenderChunk.DIRTY_OBJECT_MODIFY, zoom)) pzopt.GodRays.chunkChanged(c); // pzopt: god rays, a door / window / wall changed: the chunk's occupancy again
                if (pzopt.ChunkAo.enabled() && FBORenderChunkManager.instance.renderChunk != null && FBORenderChunkManager.instance.renderChunk.isTopLevel(level)) { // pzopt: ambient occlusion baked into the texture
                   pzopt.ChunkAo.bakeEnd(FBORenderChunkManager.instance.renderChunk, c, playerIndex, zoom, pzopt.ChunkAo.geometryDirty(renderLevels, level, zoom)); // pzopt
                } // pzopt

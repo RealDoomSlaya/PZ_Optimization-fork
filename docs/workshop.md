@@ -2,9 +2,13 @@
 
 The Workshop item is a mirror of the GitHub release, packaged the way
 [BetterFPS](https://steamcommunity.com/workshop/filedetails/?id=3022543997) does it: Steam
-downloads the files, the player installs them by hand or with the installer that ships in the
-item. The game loads nothing from it (no `media/` folder); `mod.info` only makes it appear in
-the Mods list with the instructions. GitHub releases stay the canonical channel; the Workshop
+downloads the files, the player installs them with the installer that ships in the item. The
+game loads none of the optimizations from it; the one file it loads is the install helper
+(`src/workshop/42/media/lua/client/PZ_Optimization_InstallHelper.lua`, 2026-09-27): enabled in the
+Mods list, the main menu shows the install command for that computer (the item's own folder from
+the mod's version dir) with a Copy button, or, once the overrides are installed, a note that the
+mod can be disabled again. The installers wait for a running game, so the flow is copy, paste,
+quit. GitHub releases stay the canonical channel; the Workshop
 page states the commit and the zip sha256 so the two can be checked against each other.
 
 ## Layout (`scripts/workshop.sh` writes it)
@@ -19,6 +23,7 @@ page states the commit and the zip sha256 so the two can be checked against each
     ├── poster.png
     ├── install.ps1                          the repo-root installer (the next release's asset)
     ├── install.bash                         install.sh renamed (.sh is a banned extension)
+    ├── media/lua/client/                    the install helper (src/workshop/42/), the item's only Lua
     └── pzopt-classes/                       the release zip unpacked (pzopt-files.txt included)
 ```
 
@@ -216,6 +221,18 @@ left, the game's own frames (`devCapture`) of the stock look against sun shadows
 Rosewood at 16:00 under 50 % clouds drifting at 8x speed, at 19:30 (long shadows), at 23:00 under the 1993-07-03 full moon;
 right, what is new and the chunk composite's GPU time with clouds on (632 vs 623 us). The sharp sprites card `38` lost its
 "New!" heading (its image stays).
+`40` the "New! Installation" card (`harness/install-walkthrough.py --card`; 2026-09-27, the in-game install / uninstall), with
+a layout of its own (the New! template's left column is
+~276 px on the page, too small for a terminal): the Windows walkthrough across the whole card (1 Copy the command in the
+install helper window, 2 paste into PowerShell, the installer waits, 3 QUIT, 4 installed, 5 Options > Optimizations with the
+Uninstall button), before / now as two lines under it. The sun, moon and cloud shadows card `39` lost its "New!" heading
+(its image stays). The game pictures are the game's own
+screenshots of `harness/uninstall-e2e.sh` on the flip (install window, main menu, the Optimizations tab); the install window
+is redrawn per OS with that OS's command, the terminals are drawn with the installers' real lines. The same script writes the
+install window's own animation (`--frames`: 13 PNG frames per OS under `src/workshop/42/media/ui/pzopt_install/<os>/` (unique names: `getTexture` resolves a bare name like `01` to a vanilla pack image first) + the
+hold times in `PZ_Optimization_InstallFrames.lua`; the game has no GIF decoder before the classes are installed) and the
+Mods list posters (`--posters`: `poster-install.png`, the three steps, drawn at ~200 px next to the description, and
+`poster-step1..5.png`, the thumbnails, large on hover), which a subscriber sees before enabling anything.
 `description.txt` embeds them with `[img]` from the raw GitHub URL of `master`,
 so they render only after the folder is pushed. The staged page carries da.gd short links instead (2026-09-24,
 `scripts/workshop-shorten.py`, cache `docs/workshop/short-urls.txt`, ~80 characters saved per image; da.gd is the one
@@ -224,6 +241,7 @@ If da.gd ever goes away, delete the cache line or switch the helper to another C
 `description.txt` still work but the page is ~1,600 characters longer. The same files go in the item's own carousel:
 on the Workshop page, "Add/edit images & videos" takes the JPGs (upload `00` first, it becomes
 the header) and a YouTube URL for the showcase video.
+`41` the "New! God rays" card (`harness/godrays-card-gif.py`; 2026-09-27): left, god rays off then on in the game's own frames (the lossless panes of the showcase video `docs/media/god-rays-off-vs-on.mp4`, runs `gv-room-*` and `gv-fog-*`: a Rosewood diner at 17:00, the church lot in morning fog at 08:00); right, what it draws and the frame time it adds (12 us, 0.3 % of a 240 fps frame; `docs/findings-god-rays-2026-09-27.md`). The installation card `40` is pinned under the "Install" heading instead (the maintainer, 2026-09-27: it stays on top of the install instructions whatever "New!" section comes next).
 
 ### Animated thumbnail
 
@@ -264,7 +282,9 @@ steamcmd `item.vdf` route is gone (2026-09-24).
 
 ## What the item cannot do
 
-- Nothing on the Workshop can write to the game folder; the install stays manual.
+- Nothing on the Workshop can write to the game folder; the install stays one command (the helper
+  window, or `irm .../install.ps1 | iex` / `curl .../install.sh | bash`, which find the Workshop copy
+  in the game's library themselves). The uninstall is in the game (Options > Optimizations).
 - The three Lua files under `pzopt-classes/media/lua/` are not loaded from the item (they are
   not under `42/media/`); they reach the game with the class files, as on the GitHub path.
 - A game update makes the runtime guard turn the classes off until a build for the new

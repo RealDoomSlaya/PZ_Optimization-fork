@@ -767,6 +767,7 @@ public final class Hdr {
          uF = GL20.glGetUniformLocation(prog, "pzHdrF");
          uLight = GL20.glGetUniformLocation(prog, "pzHdrLight");
          Log.info("hdr: composite program " + prog + " pzHdrA at " + uA);
+         Shaders.stockSamplerUnits(prog, "hdr"); // our sampler2Ds listed before DIFFUSE by the driver would move it off unit 0
       }
       if (uA < 0) {
          return;

@@ -505,6 +505,10 @@ update) re-run `scripts/decompile.sh` and `scripts/regen-overrides.sh`.
   water patched too) cost 0 us median at 5K; a low sun's long shadows come from a far-field column-height march
   (`sunShadowFar`, `sunMinElevationDeg` 2); wall faces come from a grid wall mask (walls under eaves were taken for roofs).
   Rigs: `devCloudTiming` + `devCloudAlternate`, `devCloudView`, `devSunView` 4-7, `devSkyDate`, `devCloudCover`.
+- Spiffo's roof flicker (2026-09-27, `docs/findings-spiffo-roof-flicker-2026-09-27.md`): with DLSS + pixelLight a flat roof over
+  a lit room flipped between its light and the room's every frame (the level pick moved with the jitter). `pplTexelHeight`
+  (height from the texel the pixel shows) + `pplFloorSnap` (flat texels within two DEPTH16 steps of a level are on it); dev
+  views `devPplView=14|15` (with `colorGrading=false hdr=false`).
 - Open plans: `docs/plan-drive-game-thread.md` (2026-09-26: late frames while driving through town), `docs/plan-graphics-enhancements.md` (2026-09-25: visual features; items 1, 2, 4 and candidate B shipped by 2026-09-26), `docs/plan-game-load.md`, `docs/plan-vulkan-renderer.md`, `docs/plan-resource-use.md`,
   `docs/plan-zombie-multithread.md` (2026-09-22: the rest of the zombie simulation on all cores, phased).
   The game-thread optimization plans were dropped on 2026-09-21 at the maintainer's request.

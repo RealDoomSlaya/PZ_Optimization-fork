@@ -33,6 +33,10 @@ CREATE INDEX IF NOT EXISTS runs_started ON runs (started);
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS cpu_w double precision, ADD COLUMN IF NOT EXISTS total_w double precision,
   ADD COLUMN IF NOT EXISTS j_per_frame double precision, ADD COLUMN IF NOT EXISTS power_source text;
 
+-- run videos in the cold-storage bucket (2026-09-27, harness/cold-store.py): its own table, so a re-import of the run
+-- (which deletes and rewrites the runs row) keeps the link
+CREATE TABLE IF NOT EXISTS run_videos (run text PRIMARY KEY, url text, object text, bytes bigint, uploaded timestamptz DEFAULT now());
+
 -- pzopt-frames.out: every game frame (Stats), the harness's own frame source on both stock and optimized
 CREATE TABLE IF NOT EXISTS frames (run text, t timestamptz, rel_s double precision, rt timestamptz, ms real, in_route boolean);
 -- pzopt-overlay.out: every presented frame with the overlay's GPU time and thread loads

@@ -90,8 +90,8 @@ Steps, in order:
    cache), prints `page: N characters` and refuses a page over 7,900 (Steam's limit is 8,000, the game
    appends ~50). The short links saved 1,640 characters on 2026-09-24 (7,825 -> 6,185). Only da.gd works:
    Steam loads description images with `crossorigin="anonymous"`, and TinyURL's and spoo.me's redirects
-   lack `Access-Control-Allow-Origin: *`, so those images break. The previous "New!" section moves down or goes when the next one arrives; the
-   README keeps the long form.
+   lack `Access-Control-Allow-Origin: *`, so those images break. The previous "New!" section moves down or goes when the next one arrives (except the install card `40-install.gif`,
+   pinned right under the "Install" heading: it never moves with the New! stack); the README keeps the long form.
 3. Commit the script, the GIF and the description and **push master first**: the
    `[img]` URLs are raw GitHub links to `master`, so the page shows a broken image until the
    push is public.

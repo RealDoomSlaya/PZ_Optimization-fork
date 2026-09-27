@@ -606,6 +606,22 @@ public final class Harness {
                if ("water".equals(HarnessFlags.get("find", ""))) {
                   findWater(p); // dev: HDR water glint scenes
                }
+               if ("forest".equals(HarnessFlags.get("find", ""))) {
+                  int[] spot = GodRays.findForest(p); // dev: god rays, under the canopy
+                  if (spot != null) {
+                     x = spot[0] + 0.5F;
+                     y = spot[1] + 0.5F;
+                     routeZ = spot[2];
+                  }
+               }
+               if ("sunwindow".equals(HarnessFlags.get("find", ""))) {
+                  int[] spot = GodRays.findSunWindow(p); // dev: god rays, into a room the light comes into through its windows
+                  if (spot != null) {
+                     x = spot[0] + 0.5F; // the route walks on from there (else its next teleport puts the player back)
+                     y = spot[1] + 0.5F;
+                     routeZ = spot[2];
+                  }
+               }
                if ("shore".equals(HarnessFlags.get("find", ""))) {
                   goToShore(p); // dev: HDR water glint scenes, the player on dry land with the water in view
                }
@@ -618,6 +634,7 @@ public final class Harness {
                Showcase.routeStart(p); // showcase=horde: the HDR horde video scene
                Explore.routeStart(p); // explore=restaurant: out of the car, the walk begins
                TreeWalk.routeStart(p); // explore=trees
+               LightWalk.routeStart(p); // explore=lights
                RoomLightRig.routeStart(p); // room_light=auto: into a lit room
                chunksAtStart = Stats.chunkCount();
                runStartNs = nowNs;
@@ -692,7 +709,7 @@ public final class Harness {
                 }
                 return;
              }
-            if (Explore.done() || TreeWalk.done() || RoomLightRig.done()) {
+            if (Explore.done() || TreeWalk.done() || LightWalk.done() || RoomLightRig.done()) {
                finish(p, 0); // explore=restaurant: every room visited (or the director said done)
                return;
             }
@@ -731,7 +748,7 @@ public final class Harness {
             // teleport tools use); it also takes the player out of a vehicle,
             // which plain setX/setY does not survive
             boolean holding = leg >= legs.size() && holdSecs > 0f;
-            if (!holding && !Showcase.active() && !Explore.active() && !TreeWalk.active() && !RoomLightRig.active() && ((int)x != p.getXi() || (int)y != p.getYi())) { // showcase=horde moves the player itself
+            if (!holding && !Showcase.active() && !Explore.active() && !TreeWalk.active() && !LightWalk.active() && !RoomLightRig.active() && ((int)x != p.getXi() || (int)y != p.getYi())) { // showcase=horde moves the player itself
                // no teleports during the hold: the player may walk away from the end square (manual tests)
                p.teleportTo((int)x, (int)y, routeZ);
             }

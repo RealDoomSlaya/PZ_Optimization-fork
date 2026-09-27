@@ -6,8 +6,9 @@ Install, remove or inspect the PZ_Optimization class overrides on Windows from a
 Standalone: needs Windows PowerShell 5.1 or newer. Nothing is compiled. The zip is fetched
 from the GitHub releases ($env:GITHUB_TOKEN is used if set; the gh CLI if logged in);
 -Zip skips the download. -From installs the same tree from an unpacked folder (no network);
-a pzopt-classes folder next to this script (the Steam Workshop item layout) is used
-automatically.
+a pzopt-classes folder next to this script (the Steam Workshop item layout), else the
+Workshop item's copy in the Steam library that holds the game, is used automatically. A running
+game is waited for: quit it and the install (or -Uninstall) goes on.
 
   .\install.ps1                                  # find the game, download the zip for its revision, install
   .\install.ps1 -Zip "$env:USERPROFILE\Downloads\pzopt-b0bbce05d5-classes.zip"
@@ -15,6 +16,10 @@ automatically.
   .\install.ps1 -Dir "D:\SteamLibrary\steamapps\common\ProjectZomboid"
   .\install.ps1 -Status
   .\install.ps1 -Uninstall
+
+Without downloading anything first (PowerShell, any folder; the Steam Workshop copy is used when present):
+  irm https://github.com/xD3I/PZ_Optimization/releases/latest/download/install.ps1 | iex
+  & ([scriptblock]::Create((irm https://github.com/xD3I/PZ_Optimization/releases/latest/download/install.ps1))) -Uninstall
 
 Files written are recorded in <game dir>\pzopt-installed.txt (same format as the Linux
 tools). projectzomboid.jar is never modified; the runtime guard turns the classes off, with
@@ -31,8 +36,26 @@ param(
   [switch]$Uninstall,
   [switch]$Status
 )
+if (-not $PSCommandPath) {
+  # piped into Invoke-Expression or run as a script block (the one-liners above): no file of its own, and `exit`
+  # would close the player's PowerShell window. Run the same script as a file in a child PowerShell instead, so
+  # exit codes, $PSScriptRoot and the parameters behave as with -File.
+  [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+  $self = Join-Path ([IO.Path]::GetTempPath()) 'pzopt-install.ps1'
+  Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/xD3I/PZ_Optimization/releases/latest/download/install.ps1' -OutFile $self
+  $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $self)
+  foreach ($k in $PSBoundParameters.Keys) {
+    $v = $PSBoundParameters[$k]
+    if ($v -is [switch]) { if ($v) { $argv += "-$k" } } else { $argv += "-$k"; $argv += "$v" }
+  }
+  & (Get-Process -Id $PID).Path @argv
+  return
+}
 $ErrorActionPreference = 'Stop'
+# GitHub needs TLS 1.2; Windows PowerShell 5.1 on older Windows offers 1.0 / 1.1 only by default
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 $RepoSlug = 'xD3I/PZ_Optimization'
+$WorkshopId = '3805285544'
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 function Fail($msg) { Write-Host "error: $msg" -ForegroundColor Red; exit 1 }
@@ -87,6 +110,49 @@ function Get-JarRevision {
   if ($m.Success) { $m.Value } else { $null }
 }
 function Get-Sha256($path) { (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLower() }
+function Test-GameRunning {
+  [bool](Get-Process ProjectZomboid64 -ErrorAction SilentlyContinue | Where-Object { $_.Path -and (Split-Path $_.Path -Parent).TrimEnd('\','/') -eq $Dir.TrimEnd('\','/') })
+}
+# The files must not change under a running game: wait for it (the in-game helper's flow is paste, then quit)
+function Wait-GameClosed {
+  if (-not (Test-GameRunning)) { return }
+  Write-Host "the game is running from ${Dir}: quit it (QUIT in the main menu); this goes on once it has closed (Ctrl+C cancels)"
+  while (Test-GameRunning) { Start-Sleep -Seconds 1 }
+  Start-Sleep -Seconds 1
+}
+# The newest copy of the Steam Workshop item for this game revision, or $null: Steam keeps an app's Workshop content
+# in the library of the app itself, <library>\steamapps\workshop\content\108600\<item>\mods\PZ_Optimization\<version>.
+# Complete only when every file its pzopt-files.txt lists is there (Steam replaces an item's files one by one).
+function Find-WorkshopCopy {
+  $d = $Dir
+  while ($d -and ((Split-Path $d -Leaf) -ne 'steamapps')) {
+    $up = Split-Path $d -Parent
+    if ($up -eq $d) { $d = $null; break }
+    $d = $up
+  }
+  if (-not $d) { return $null }
+  $mod = [IO.Path]::Combine($d, 'workshop', 'content', '108600', $WorkshopId, 'mods', 'PZ_Optimization')
+  if (-not (Test-Path -LiteralPath $mod)) { return $null }
+  $best = $null; $bestBuilt = [long]-1
+  foreach ($v in Get-ChildItem -LiteralPath $mod -Directory) {
+    $c = Join-Path $v.FullName 'pzopt-classes'
+    $info = Join-Path $c 'pzopt\build-info.properties'
+    $list = Join-Path $c 'pzopt-files.txt'
+    if (-not (Test-Path -LiteralPath $info) -or -not (Test-Path -LiteralPath $list)) { continue }
+    $p = @{}
+    foreach ($l in Get-Content -LiteralPath $info) { if ($l -match '^([^#=]+)=(.*)$') { $p[$Matches[1].Trim()] = $Matches[2].Trim() } }
+    if ($p['revision'] -ne $Rev) { continue }
+    $complete = $true
+    foreach ($rel in Get-Content -LiteralPath $list) {
+      if ($rel -and -not (Test-Path -LiteralPath (Join-Path $c ($rel -replace '/', '\')))) { $complete = $false; break }
+    }
+    if (-not $complete) { Write-Host "skipping $c`: Steam is still updating it"; continue }
+    $built = [long]0
+    [void][long]::TryParse([string]$p['built'], [ref]$built)
+    if ($built -gt $bestBuilt) { $best = $c; $bestBuilt = $built }
+  }
+  return $best
+}
 
 # A launcher JSON that pzopt's AOT-cache mode (pzopt.AotCache) switched to its jar form goes back to the loose
 # classes ("." first, no AOT options), and the jar and cache go: the loose files are about to change.
@@ -165,6 +231,7 @@ if ($Status) {
 }
 
 if ($Uninstall) {
+  Wait-GameClosed
   Reset-Aot
   Reset-Gc
   $filesTxt = Join-Path $Dir 'pzopt-files.txt'
@@ -188,8 +255,7 @@ if ($Uninstall) {
 
 # --- install ---------------------------------------------------------------------------
 
-$running = Get-Process ProjectZomboid64 -ErrorAction SilentlyContinue | Where-Object { $_.Path -and (Split-Path $_.Path -Parent).TrimEnd('\','/') -eq $Dir.TrimEnd('\','/') }
-if ($running) { Fail "the game is running from $Dir; close it first" }
+Wait-GameClosed
 if (Test-Path $Manifest) { Fail 'already installed (see -Status); run -Uninstall first' }
 if (-not $Rev) { Fail "could not read the game revision from $Jar" }
 
@@ -201,9 +267,13 @@ if (($cp.IndexOf('.') -lt 0) -or ($cp.IndexOf('projectzomboid.jar') -lt 0) -or (
 }
 
 $tmp = $null
-if (-not $Zip -and -not $From) {
+if (-not $Zip -and -not $From -and $PSScriptRoot) {
   $sibling = Join-Path $PSScriptRoot 'pzopt-classes'
   if (Test-Path (Join-Path $sibling 'pzopt\build-info.properties')) { $From = $sibling }
+}
+if (-not $Zip -and -not $From -and -not $Tag) {
+  $From = Find-WorkshopCopy
+  if ($From) { Write-Host "found the Steam Workshop copy for revision $Rev" }
 }
 if ($From) {
   if (-not (Test-Path (Join-Path $From 'pzopt\build-info.properties'))) { Fail "$From is not an unpacked PZ_Optimization release (no pzopt\build-info.properties)" }
@@ -226,7 +296,7 @@ if ($From) {
   } else {
     $h = @{ Accept = 'application/vnd.github+json' }
     if ($env:GITHUB_TOKEN) { $h.Authorization = "Bearer $env:GITHUB_TOKEN" }
-    $rels = Invoke-RestMethod -Headers $h "https://api.github.com/repos/$RepoSlug/releases?per_page=50"
+    $rels = Invoke-RestMethod -UseBasicParsing -Headers $h "https://api.github.com/repos/$RepoSlug/releases?per_page=50"
     $asset = $null
     # the list's order is by the tagged commit's date, not by publish date
     foreach ($r in ($rels | Sort-Object -Property published_at -Descending)) {
@@ -237,7 +307,7 @@ if ($From) {
     if (-not $asset) { Fail "no release has $pattern (your game revision $Rev is a build these classes were not built for)" }
     Write-Host "downloading $pattern from release $Tag"
     $h.Accept = 'application/octet-stream'
-    Invoke-WebRequest -Headers $h -Uri $asset.url -OutFile (Join-Path $tmp $pattern)
+    Invoke-WebRequest -UseBasicParsing -Headers $h -Uri $asset.url -OutFile (Join-Path $tmp $pattern)
   }
   $Zip = Join-Path $tmp $pattern
 }

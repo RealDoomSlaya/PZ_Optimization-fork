@@ -151,6 +151,7 @@ public class WeatherShader extends Shader {
       GL20.glUniform1f(this.blurFactor, texd.vars[23]);
       pzopt.Hdr.worldUniforms(); // pzopt: HDR output, the world expansion's uniforms on the bound composite program
       pzopt.Grade.worldUniforms(this.getID()); // pzopt: colour grading, the LUT and its switch on the bound composite program
+      pzopt.GodRays.worldUniforms(this.getID()); // pzopt: god rays, the volume and its mapping on the bound composite program
    }
 
    public void onCompileSuccess(ShaderProgram sender) {

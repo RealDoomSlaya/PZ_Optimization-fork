@@ -212,6 +212,20 @@ public final class PerformanceSettings {
       return pzopt.Restart.relaunch();
    }
 
+   // pzopt: the Optimizations tab's "Uninstall PZ Optimization" button (pzopt.Uninstall): "" when it can run, else why not;
+   // the press starts the helper that deletes the files once the game has quit, then the Lua quits it
+   public String getPzoptUninstallUnavailable() {
+      return pzopt.Uninstall.unavailableReason();
+   }
+
+   public boolean pzoptUninstall() {
+      return pzopt.Uninstall.start();
+   }
+
+   public String getPzoptUninstallMessage() {
+      return pzopt.Uninstall.message();
+   }
+
    // pzopt: the Enhancements tab's "Install DLSS files" button polls pzopt.UpscalerDeps through these: one check
    // of what this machine needs, then the download into natives/ on a daemon thread; states in UpscalerDeps.State.
    public void pzoptUpscalerDepsCheck() {

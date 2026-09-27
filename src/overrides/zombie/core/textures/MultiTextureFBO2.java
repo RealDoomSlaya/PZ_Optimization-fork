@@ -304,6 +304,7 @@ public final class MultiTextureFBO2 {
          pzopt.Upscaler.queueResolve(); // pzopt: upscaler, the low-res world image is resolved to the screen size on the render thread before the quads below
          pzopt.Hdr.queueWorldStats(); // pzopt: HDR output, the world's average luminance for the composite's expansion
          pzopt.GpuSections.begin(pzopt.Darkness.section("screen")); // pzopt: GPU section (the full-size screen-shader composite; devDarkAlternate splits it by the grade's state)
+         pzopt.GodRays.screenBegin(); // pzopt: god rays, dev timing of the composite (devGodRaysTiming); godRaysLateDraw, the light volumes over the finished world
 
          for (int playerIndex = 0; playerIndex <= max; playerIndex++) {
             if (SceneShaderStore.weatherShader != null && DebugOptions.instance.fboRenderChunk.useWeatherShader.getValue()) {
@@ -338,6 +339,7 @@ public final class MultiTextureFBO2 {
          }
 
          pzopt.Hdr.queueGainAlpha(); // pzopt: HDR output on 8-bit back buffers (macOS EDR bridge): the world gain into alpha
+         pzopt.GodRays.screenEnd(); // pzopt: god rays, dev timing
          pzopt.GpuSections.end(pzopt.Darkness.section("screen")); // pzopt: GPU section
          pzopt.Upscaler.queueCompositeFlush(); // pzopt: upscaler, dlssFlushAfterComposite
          IsoPlayer.forEachPlayer(MultiTextureFBO2::renderCursor);

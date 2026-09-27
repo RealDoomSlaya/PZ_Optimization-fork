@@ -134,6 +134,7 @@ public final class Scene {
       Showcase.worldReady(p); // showcase=horde: god mode, unseen, power off, the area cleared until the scene starts
       Explore.worldReady(p); // explore=restaurant: the walk through the nearest restaurant
       TreeWalk.worldReady(p); // explore=trees: from tree to tree, circling and watching each
+      LightWalk.worldReady(p); // explore=lights: out of the car, round it, from lamp to lamp (floating light orbs report)
       SoundProbe.apply(); // house_alarm / car_alarm / sound_probe
       if (soundRadius > 0) {
          Log.info("harness: sound=" + soundRadius + " every " + soundEvery + " frame(s) from the player's square, hearing="
@@ -309,6 +310,7 @@ public final class Scene {
       Showcase.tick(p, nowNs); // showcase=horde: aim, fire, keep the lights on
       Explore.tick(p, nowNs); // explore=restaurant: walk, look around
       TreeWalk.tick(p, nowNs); // explore=trees: walk, circle, watch; the trees' screen rectangles
+      LightWalk.tick(p, nowNs); // explore=lights: walk, circle, watch; the lights' screen positions
       RoomLightRig.tick(p, nowNs); // room_light=auto: the room light off / on timeline
       ThumpRig.tick(p, nowNs); // thump=N: zombies thumping a door off-screen (the thump-burst repro)
       crowdTick(p, nowNs); // crowd=N: a crowd around the player (the capsule shadow rig)

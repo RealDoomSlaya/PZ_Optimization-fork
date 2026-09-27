@@ -101,7 +101,7 @@ public final class FogPass {
     * On any failure the renderbuffer is put back. Textures of FBOs that no longer exist are deleted here.
     */
    public static void sceneDepthAsTexture(zombie.core.textures.TextureFBO fbo, Texture tex) {
-      if (!Overrides.enabled() || !(Config.FOG_PASS || Config.AO && "screen".equals(Config.AO_MODE) || Config.PIXEL_LIGHT || Config.SSR) || Config.FOG_DEPTH_COPY || fbo == null) { // ambient occlusion reads it in place too
+      if (!Overrides.enabled() || !(Config.FOG_PASS || Config.AO && "screen".equals(Config.AO_MODE) || Config.PIXEL_LIGHT || Config.SSR || Config.GOD_RAYS) || Config.FOG_DEPTH_COPY || fbo == null) { // ambient occlusion reads it in place too
          return;
       }
       zombie.core.opengl.RenderThread.invokeOnRenderContext(() -> {
@@ -151,11 +151,39 @@ public final class FogPass {
                + ", GL error 0x" + Integer.toHexString(err) + ")");
          } else {
             GL30.glDeleteRenderbuffers(rb); // TextureFBO.destroy deletes the name again later, which GL ignores
-            sceneDepthTextures.add(new int[] {id, depthTex});
+            sceneDepthTextures.add(new int[] {id, depthTex, w, h});
             Log.info("fog pass: offscreen buffer " + w + "x" + h + " (fbo " + id + ") depth+stencil is texture " + depthTex);
          }
          GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, previous);
       });
+   }
+
+   /** Render thread: the scene framebuffer's depth texture (sceneDepthAsTexture), 0 when it kept its renderbuffer. */
+   static int sceneDepthTexture(int fbo) {
+      for (int[] e : sceneDepthTextures) {
+         if (e[0] == fbo) {
+            return e[1];
+         }
+      }
+      return 0;
+   }
+
+   static int sceneDepthWidth(int fbo) {
+      for (int[] e : sceneDepthTextures) {
+         if (e[0] == fbo) {
+            return e[2];
+         }
+      }
+      return 0;
+   }
+
+   static int sceneDepthHeight(int fbo) {
+      for (int[] e : sceneDepthTextures) {
+         if (e[0] == fbo) {
+            return e[3];
+         }
+      }
+      return 0;
    }
 
    private static java.lang.reflect.Field fboIdField;
@@ -412,6 +440,10 @@ public final class FogPass {
          }
          GL33.glBindSampler(0, 0);
          GpuSections.markNow("fog.rects", true);
+         // pzopt god rays: the shade of the air the sun misses, once per fog texel at its near and far depth (the
+         // composite's depth-aware upsampling carries it: no fetch of its own per screen pixel)
+         GodRays.fogShade(this.fogFbo, scaled ? this.fogFarFbo : 0, this.fogDepthTex, scaled ? this.fogMaxDepthTex : 0, (float)vw / fw, (float)vh / fh,
+            inPlace ? vx : 0, inPlace ? vy : 0, sceneDepthWidth(currentFbo), sceneDepthHeight(currentFbo));
 
          GpuSections.markNow("fog.composite", false);
          // 3. back to the scene: the fog buffer over it once, premultiplied; below 100 % each screen pixel takes the
@@ -432,6 +464,7 @@ public final class FogPass {
          GL20.glUniform1i(this.uniDevView, Config.DEV_FOG_DEPTH_VIEW);
          GL20.glUniform1i(this.uniCompMax, 3);
          GL20.glUniform1i(this.uniCompFar, 4);
+         GodRays.fogComposite(this.compositeProgram, 5); // pzopt god rays: the shade of the shadowed air in the fog, in this pass
          GL13.glActiveTexture(GL13.GL_TEXTURE4);
          GL11.glBindTexture(GL11.GL_TEXTURE_2D, this.fogFarTex);
          GL13.glActiveTexture(GL13.GL_TEXTURE3);
@@ -452,6 +485,9 @@ public final class FogPass {
          GpuSections.markNow("fog.composite", true);
 
          // 4. leave the state the way VBORenderer / the sprite ring buffer expect it
+         GL13.glActiveTexture(GL13.GL_TEXTURE5);
+         GL11.glBindTexture(GL11.GL_TEXTURE_2D, 0);
+         GL11.glBindTexture(org.lwjgl.opengl.GL12.GL_TEXTURE_3D, 0); // (the god rays' shade volume)
          GL13.glActiveTexture(GL13.GL_TEXTURE4);
          GL11.glBindTexture(GL11.GL_TEXTURE_2D, 0);
          GL13.glActiveTexture(GL13.GL_TEXTURE3);
@@ -785,7 +821,7 @@ public final class FogPass {
       }
    }
 
-   private static int link(String vert, String frag, String[] attribs, String[] fragData) {
+   static int link(String vert, String frag, String[] attribs, String[] fragData) {
       int vs = compile(GL20.GL_VERTEX_SHADER, vert);
       int fs = compile(GL20.GL_FRAGMENT_SHADER, frag);
       if (vs == 0 || fs == 0) {
@@ -1023,8 +1059,30 @@ public final class FogPass {
       "uniform vec4 compInfo;", // fog texels per screen pixel in x and y, viewport origin x and y
       "uniform vec4 compSize;", // fog buffer width and height, depth-aware flag, scene depth positioned at the viewport flag
       "uniform int devView;",
+      "uniform sampler3D GodRays;", // pzopt.GodRays' shade volume (r: sqrt of the air the sun misses) when the god rays' fog shade rides this pass
+      "uniform vec4 godRays;", // x on (godRaysFogShade=pixel: the tap per pixel; lowres shades the fog buffer before this pass), y shade strength, z the ground's tc
+      "uniform vec4 godRaysX;", // the volume's tc = dot(X / Y / Z, (depth uv, depth, 1))
+      "uniform vec4 godRaysY;",
+      "uniform vec4 godRaysZ;",
       "out vec4 fragColor;",
+      "void fogMain();",
+      "float pzDp = -1.0;", // the pixel's depth when fogMain read it (the god rays reuse it)
       "void main() {",
+      "   fogMain();",
+      // the god rays' shade (the fog's air that the sun does not reach: (1 - T) - F of the pixel's view column): the scene
+      // behind the fog times sqrt(1 - k miss) (display space), from the pixel's own depth: no pass of its own
+      "   if (godRays.x > 0.5) {",
+      "      ivec2 ds = textureSize(SceneDepth, 0);",
+      "      vec2 sp = compSize.w > 0.5 ? gl_FragCoord.xy : gl_FragCoord.xy - compInfo.zw;",
+      "      float d = pzDp >= 0.0 ? pzDp : texelFetch(SceneDepth, ivec2(sp), 0).r;",
+      "      vec4 q = vec4(floor(sp) + 0.5, 0.0, 1.0); q.xy /= vec2(ds); q.z = d;",
+      "      vec3 tc = vec3(dot(godRaysX, q), dot(godRaysY, q), d >= 0.99999 ? godRays.z : dot(godRaysZ, q));",
+      "      float s = texture(GodRays, tc).r;", // sqrt of the air the sun misses (GodRays' one-byte shade volume)
+      "      float m = clamp(1.0 - godRays.y * s * s, 0.0, 1.0);",
+      "      fragColor.a = 1.0 - (1.0 - fragColor.a) * sqrt(m);",
+      "   }",
+      "}",
+      "void fogMain() {",
       "   vec2 p = gl_FragCoord.xy - compInfo.zw;",
       "   vec2 sp = compSize.w > 0.5 ? gl_FragCoord.xy : p;",
       "   if (devView > 0) {",
@@ -1049,6 +1107,7 @@ public final class FogPass {
       "   vec4 dn = vec4(texelFetch(FogDepth, a, 0).r, texelFetch(FogDepth, b, 0).r, texelFetch(FogDepth, c, 0).r, texelFetch(FogDepth, d, 0).r);",
       "   vec4 df = vec4(texelFetch(MaxDepth, a, 0).r, texelFetch(MaxDepth, b, 0).r, texelFetch(MaxDepth, c, 0).r, texelFetch(MaxDepth, d, 0).r);",
       "   float dp = texelFetch(SceneDepth, ivec2(sp), 0).r;",
+      "   pzDp = dp;",
       // each texel's fog at this pixel's own depth: between the rows in front of the block's nearest depth and the
       // rows in front of its farthest, by where the pixel's depth lies in that range (the rows accumulate with depth)
       "   vec4 t = clamp((vec4(dp) - dn) / max(df - dn, vec4(0.00001)), 0.0, 1.0);",

@@ -9,6 +9,10 @@
 #   ./install.sh --status
 #   ./install.sh --uninstall
 #
+# Without downloading anything first (any folder; the Steam Workshop copy is used when present):
+#   curl -fsSL https://github.com/xD3I/PZ_Optimization/releases/latest/download/install.sh | bash
+#   curl -fsSL https://github.com/xD3I/PZ_Optimization/releases/latest/download/install.sh | bash -s -- --uninstall
+#
 # The zip holds the same class files for Windows, Linux and macOS (the Steam depots ship one jar);
 # the runtime guard disables them, with one console.txt line, if the game revision differs.
 # Files written are recorded in <game dir>/pzopt-installed.txt, the manifest scripts/pzopt.sh
@@ -19,10 +23,13 @@
 # The zip is fetched from the GitHub releases with curl (GITHUB_TOKEN is used if set, to
 # avoid API rate limits) or with the gh CLI when it is logged in; --zip skips the download.
 # --from installs the same tree from a folder instead (no network, no unzip); a pzopt-classes/
-# folder next to this script (the Steam Workshop item layout) is used automatically.
+# folder next to this script (the Steam Workshop item layout), else the Workshop item's copy in the
+# Steam library that holds the game, is used automatically. A running game is waited for: quit it
+# and the install (or --uninstall) goes on.
 set -euo pipefail
 
 REPO_SLUG="xD3I/PZ_Optimization"
+WORKSHOP_ID="3805285544"
 mode=install; zip=""; from=""; dir="${PZ_DIR:-}"; tag=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -32,7 +39,7 @@ while [[ $# -gt 0 ]]; do
     --tag) tag="$2"; shift ;;
     --uninstall) mode=uninstall ;;
     --status) mode=status ;;
-    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -129,6 +136,56 @@ if ch[0]: json.dump(j,open(p,"w"),indent="\t"); print("launcher: pzopt's G1 swit
 PYEOF
 }
 
+game_running() {
+  local pid
+  for pid in $(pgrep -f '[P]rojectZomboid64' || true); do
+    [[ "$(readlink -f "/proc/$pid/cwd" 2>/dev/null)" == "$(readlink -f "$dir")" ]] && return 0
+  done
+  if [[ -x "$MAC_LAUNCHER" ]] && pgrep -f "$(cd "$dir/.." && pwd)/MacOS/JavaAppLauncher" >/dev/null 2>&1; then return 0; fi
+  # a JVM started some other way (java ... zombie.gameStates.MainScreenState) with the game folder as its working dir;
+  # macOS has no /proc: lsof names the cwd
+  for pid in $(pgrep -f 'zombie[.]gameStates[.]MainScreenState' || true); do
+    local cwd
+    if [[ -e "/proc/$pid/cwd" ]]; then cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null)
+    else cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1); fi
+    [[ -n "$cwd" && "$(cd "$cwd" 2>/dev/null && pwd -P)" == "$(cd "$dir" && pwd -P)" ]] && return 0
+  done
+  return 1
+}
+# The files must not change under a running game: wait for it (the in-game helper's flow is paste, then quit)
+wait_game_closed() {
+  game_running || return 0
+  echo "the game is running from $dir: quit it (QUIT in the main menu); this goes on once it has closed (Ctrl+C cancels)"
+  while game_running; do sleep 1; done
+  sleep 1
+}
+
+# The newest copy of the Steam Workshop item for this game revision: Steam keeps an app's Workshop content in the
+# library of the app itself, <library>/steamapps/workshop/content/108600/<item>/mods/PZ_Optimization/<version>.
+# Complete only when every file its pzopt-files.txt lists is there (Steam replaces an item's files one by one).
+workshop_copy() {
+  local d v c info built best="" bestbuilt=-1 rel complete
+  d=$(cd "$dir" && pwd -P)
+  while [[ -n "$d" && "$d" != "/" && "$(basename "$d")" != steamapps ]]; do d=$(dirname "$d"); done
+  [[ "$(basename "$d")" == steamapps ]] || return 0
+  for v in "$d/workshop/content/108600/$WORKSHOP_ID/mods/PZ_Optimization"/*/; do
+    c="${v%/}/pzopt-classes"
+    info="$c/pzopt/build-info.properties"
+    [[ -f "$info" && -f "$c/pzopt-files.txt" ]] || continue
+    [[ "$(sed -n 's/^revision=//p' "$info")" == "$REV" ]] || continue
+    complete=1
+    while IFS= read -r rel; do
+      [[ -z "$rel" || -f "$c/$rel" ]] || { complete=0; break; }
+    done < "$c/pzopt-files.txt"
+    if [[ $complete -eq 0 ]]; then echo "skipping $c: Steam is still updating it" >&2; continue; fi
+    built=$(sed -n 's/^built=//p' "$info")
+    [[ "$built" =~ ^[0-9]+$ ]] || built=0
+    if (( built > bestbuilt )); then best="$c"; bestbuilt=$built; fi
+  done
+  if [[ -n "$best" ]]; then echo "$best"; fi
+  return 0
+}
+
 # --- status / uninstall -------------------------------------------------------------------
 
 if [[ $mode == status ]]; then
@@ -151,6 +208,7 @@ if [[ $mode == status ]]; then
 fi
 
 if [[ $mode == uninstall ]]; then
+  wait_game_closed
   reset_aot
   reset_gc "$JSON"
   list=""
@@ -173,12 +231,7 @@ fi
 
 # --- install ------------------------------------------------------------------------------
 
-for pid in $(pgrep -f '[P]rojectZomboid64' || true); do
-  [[ "$(readlink -f "/proc/$pid/cwd" 2>/dev/null)" == "$(readlink -f "$dir")" ]] && die "the game is running from $dir; close it first"
-done
-if [[ -x "$MAC_LAUNCHER" ]] && pgrep -f "$(cd "$dir/.." && pwd)/MacOS/JavaAppLauncher" >/dev/null 2>&1; then
-  die "the game is running from $dir; close it first"
-fi
+wait_game_closed
 [[ -f "$MANIFEST" ]] && die "already installed (see --status); run --uninstall first"
 [[ -n "$REV" ]] || die "could not read the game revision from $JAR"
 
@@ -196,9 +249,14 @@ else
   tr -d '\n ' < "$JSON" | grep -q '"classpath":\[".","projectzomboid.jar"' || die "$JSON classpath does not put \".\" before projectzomboid.jar"
 fi
 
-if [[ -z "$zip" && -z "$from" ]]; then
+# ${BASH_SOURCE[0]:-}: empty when the script comes through a pipe (curl ... | bash)
+if [[ -z "$zip" && -z "$from" && -f "${BASH_SOURCE[0]:-}" ]]; then
   sibling="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pzopt-classes"
   [[ -f "$sibling/pzopt/build-info.properties" ]] && from="$sibling"
+fi
+if [[ -z "$zip" && -z "$from" && -z "$tag" ]]; then
+  from=$(workshop_copy)
+  if [[ -n "$from" ]]; then echo "found the Steam Workshop copy for revision $REV"; fi
 fi
 if [[ -n "$from" ]]; then
   [[ -f "$from/pzopt/build-info.properties" ]] || die "$from is not an unpacked PZ_Optimization release (no pzopt/build-info.properties)"

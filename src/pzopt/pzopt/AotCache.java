@@ -94,7 +94,22 @@ public final class AotCache {
          GcChoice.step(); // the launcher's collector (gcMode), on this thread so the two JSON writers never overlap
       }, "pzopt-aot");
       t.setDaemon(true);
+      thread = t;
       t.start();
+   }
+
+   private static volatile Thread thread;
+
+   /** pzopt.Uninstall: waits (at most {@code ms}) for the boot's launcher-JSON writes, so none lands after its undo. */
+   static void awaitBootWrites(long ms) {
+      Thread t = thread;
+      if (t != null) {
+         try {
+            t.join(ms);
+         } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+         }
+      }
    }
 
    private static boolean wanted() {

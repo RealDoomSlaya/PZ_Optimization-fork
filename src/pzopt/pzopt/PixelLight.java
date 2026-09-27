@@ -1641,6 +1641,7 @@ public final class PixelLight {
                // the game's ShaderProgram renumbers every sampler2D to units 0, 1, 2... after the link (layout(binding) lost;
                // the sampler2DArray ones keep theirs): the mask's unit again (the program is bound here)
                GL20.glUniform1i(loc[15], MASK_UNIT);
+               Shaders.stockSamplerUnits(program, "pixel light"); // and the game's DIFFUSE / DEPTH on 0 / 1 whatever order the driver lists them in
             }
          }
 
@@ -2338,6 +2339,8 @@ public final class PixelLight {
       "   if (view == 11) L = B.rgb;", // dev: the base light between the centres
       "   if (view == 12) L = vec3(V, B.a, float(wet));", // dev: the torch visibility, the simple flag, wet
       "   if (view == 13) L = vec3(P.z < -0.05 ? 1.0 : 0.0, clamp(P.z / 6.0, 0.0, 1.0), fract(P.z));", // dev: the reconstructed height (red below level 0, green up to 6 levels, blue the fraction)
+      "   if (view == 14) L = vec3(clamp((P.z - floor(P.z + 0.5)) * 12.75 + 0.5, 0.0, 1.0));", // dev: the height's offset from the nearest level, grey (the screen shader's desaturation leaves it): 0.5 = on it, 1/255 = 0.0003 levels, +-0.039
+      "   if (view == 15) L = vec3(fz > 0.001 ? 1.0 : 0.0, fract(lz / 4.0) + 0.125, P.z < lz ? 1.0 : 0.0);", // dev: red the wall path, green the level read, blue lifted by the tolerance
       "#endif",
       "   return L;",
       "}");
@@ -2465,12 +2468,45 @@ public final class PixelLight {
       "   vec4 c = vec4(1.0, 1.0, 1.0, 1.0);",
       "   if (useTexture == 1) c = texture(DIFFUSE, texCoord.st);",
       "   float dt = texture(DEPTH, texCoord.st).r;",
+      "#ifdef PPL_TEXEL_Z",
+      // pplTexelHeight: the height (hence the level whose light the pixel takes) from the texel the pixel shows: its centre's
+      // window y and its own depth. The pixel centre paired with the nearest texel's depth put a point up to half a texel off
+      // the surface; the upscaler's jitter moves the pixel centre inside the texel every frame, and the tile-edge rows of a flat
+      // roof (written up to 0.005 levels low, the tolerance is 0.006) flipped to the level below: Spiffo's roof flickered with DLSS.
+      // The chunk quad is axis-aligned: window y maps linearly to texel y (derivatives taken before any discard)
+      "   float zty = texCoord.t * float(textureSize(DEPTH, 0).y);",
+      "   float zwy = dFdy(zty);",
+      "   vec2 zfc = vec2(gl_FragCoord.x, gl_FragCoord.y + (abs(zwy) > 1e-6 ? (floor(zty) + 0.5 - zty) / zwy : 0.0));",
+      "   float zdt = texelFetch(DEPTH, clamp(ivec2(floor(texCoord.st * vec2(textureSize(DEPTH, 0)))), ivec2(0), textureSize(DEPTH, 0) - 1), 0).r;",
+      "#endif",
       // an empty texel (no colour, cleared depth) blends nothing and writes the far plane: skipped (no blend, no depth write)
       "   if (pplClear > 0.5 && c.a <= 0.0 && dt >= 1.0) discard;",
       "   float d = chunkDepth + dt;",
       "   gl_FragDepth = d;",
       "   if (pplOn > 0.5 && (int(pplOpt2.w + 0.5) & 16) == 0) {",
+      "#ifdef PPL_TEXEL_Z",
+      "      vec3 P = pplPos(zfc, chunkDepth + zdt);",
+      // a floor within two DEPTH16 steps of a level (0.0013 levels a step) is on that level: snapped, so the tolerance's lift and its brighter-of-two-levels rule (meant for the top
+      // row of a wall of the level below) never take it (a flat roof over a lit room read the room's light: bright triangles
+      // on Spiffo's roof). Flat = the texels K rows above and below reconstruct within 35 % of a wall's rise over K texels
+      "#ifdef PPL_FLOOR_SNAP",
+      "      float zr = floor(P.z + 0.5);",
+      "      if (abs(P.z - zr) < 0.0026 && P.z != zr) {", // two DEPTH16 steps: a wall top's flat trim sits further below (it went dark at 0.006: the level above's light)
+      "         ivec2 zts = textureSize(DEPTH, 0);",
+      "         ivec2 zti = clamp(ivec2(floor(texCoord.st * vec2(zts))), ivec2(0), zts - 1);",
+      "         const int ZK = 2;",
+      "         float zwpt = abs(zwy) > 1e-6 ? 1.0 / zwy : 0.0;", // window px per texel along y (signed)
+      "         float zlim = max(0.35 * float(ZK) * abs(pplMapA.z * zwpt) / 6.0, 0.0026);", // a wall rises |kB| / 6 levels a window px; floors 2 DEPTH16 steps
+      "         float za = texelFetch(DEPTH, ivec2(zti.x, min(zti.y + ZK, zts.y - 1)), 0).r, zb = texelFetch(DEPTH, ivec2(zti.x, max(zti.y - ZK, 0)), 0).r;",
+      "         bool zflat = za < 1.0 || zb < 1.0;", // a cleared texel is no evidence either way
+      "         if (za < 1.0) zflat = abs(pplPos(zfc + vec2(0.0, float(ZK) * zwpt), chunkDepth + za).z - P.z) < zlim;",
+      "         if (zflat && zb < 1.0) zflat = abs(pplPos(zfc - vec2(0.0, float(ZK) * zwpt), chunkDepth + zb).z - P.z) < zlim;",
+      "         if (zflat) P.z = zr;",
+      "      }",
+      "#endif",
+      "#else",
       "      vec3 P = pplPos(gl_FragCoord.xy, d);",
+      "#endif",
       "      float dz = 0.0;",
       "#ifdef PPL_BASE",
       "      vec3 n = vec3(0.0, 0.0, 1.0);",
@@ -2495,7 +2531,7 @@ public final class PixelLight {
       "      int view = int(pplMapC.w + 0.5);",
       "      if (c.a > 0.0 && view != 2) {",
       "         vec3 L = pplLight(P, dz, n);",
-      "         c.rgb = view == 1 || view == 3 || view == 13 ? L * c.a : c.rgb * L + pplSpec * c.a;", // premultiplied; the glints on top
+      "         c.rgb = view == 1 || view == 3 || view == 13 || view == 14 || view == 15 ? L * c.a : c.rgb * L + pplSpec * c.a;", // premultiplied; the glints on top
       "      }",
       "#else",
       "      if (c.a > 0.0) c.rgb = c.rgb * pplLight(P, dz, n) + pplSpec * c.a;", // premultiplied; the glints on top
@@ -2508,7 +2544,8 @@ public final class PixelLight {
       "}");
 
    /** The game's chunkShader.frag (DIFFUSE x vertex colour, depth = chunkDepth + the texture's depth) with the light multiplied in. */
-   private static final String TINT = (Config.DEV_PPL_TINT ? "#define PPL_TINT\n" : "") + (Config.PPL_TEXEL_POS ? "#define PPL_TEXEL\n#define PPL_NSPAN " + Config.PPL_NORMAL_SPAN + "\n" : ""); // the defines every chunk program gets
+   private static final String TINT = (Config.DEV_PPL_TINT ? "#define PPL_TINT\n" : "") + (Config.PPL_TEXEL_POS ? "#define PPL_TEXEL\n#define PPL_NSPAN " + Config.PPL_NORMAL_SPAN + "\n" : "")
+      + (Config.PPL_TEXEL_HEIGHT ? "#define PPL_TEXEL_Z\n" + (Config.PPL_FLOOR_SNAP ? "#define PPL_FLOOR_SNAP\n" : "") : ""); // the defines every chunk program gets
    private static final String CHUNK_FRAG = "#version 420\n" + (Config.DEV_PPL_VIEW != 0 ? "#define PPL_DEV\n" : "") + TINT + CHUNK_FRAG_BODY; // dev views compiled in only when asked: they keep values alive to the end (registers)
    /** The same without the dynamic lights (chunk textures no light reaches): 32 registers, full occupancy on the 890M (64 with). */
    private static final String CHUNK_BASE_FRAG = "#version 420\n#define PPL_BASE\n" + CHUNK_FRAG_BODY;

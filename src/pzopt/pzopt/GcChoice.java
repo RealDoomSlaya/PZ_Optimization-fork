@@ -171,6 +171,23 @@ public final class GcChoice {
       return changed[0];
    }
 
+   /** pzopt.Uninstall: the launcher's own collector and JIT flags again (both undos); true when the JSON changed. */
+   static boolean undo(Path game) throws java.io.IOException {
+      Path json = game.resolve("ProjectZomboid64.json");
+      if (!Files.isRegularFile(json)) {
+         return false;
+      }
+      JSONObject j = new JSONObject(Files.readString(json, StandardCharsets.UTF_8));
+      String before = j.toString();
+      toStock(j);
+      jitToStock(j);
+      if (j.toString().equals(before)) {
+         return false;
+      }
+      save(game, j);
+      return true;
+   }
+
    private static int indexOf(JSONArray a, String s) {
       for (int i = 0; i < a.length(); i++) {
          if (s.equals(a.optString(i))) {

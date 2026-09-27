@@ -755,6 +755,33 @@ public final class CloudShadow {
       GL13.glActiveTexture(GL13.GL_TEXTURE0);
    }
 
+   /**
+    * Render thread (god rays' haze): the field texture (0 when clouds are off or not ready) and, in out[0..11], the cloud
+    * uv of a world point (x, y relative to (ox, oy), z levels): u = x * o0 + z * o1 + o2, v = y * o0 + z * o3 + o4 (the base
+    * layer; wrapped), the detail layer's scale and offset (o5, o6, o7), 1 - cover, 1 / (cover x edge), erosion, opacity / (1 - e^-3).
+    */
+   static int hazeField(int ox, int oy, float[] out) {
+      if (!enabled() || strength <= 0F || !ensureField()) {
+         return 0;
+      }
+      double P = N * SQUARES_PER_TEXEL * Config.CLOUD_SCALE_PCT / 100.0;
+      out[0] = (float)(1.0 / P);
+      out[1] = (float)(parA / P);
+      out[2] = (float)floorModD((ox + parX + driftX) / P, 1.0);
+      out[3] = (float)(parB / P);
+      out[4] = (float)floorModD((oy + parY + driftY) / P, 1.0);
+      double dP = P / DETAIL_SCALE;
+      out[5] = DETAIL_SCALE;
+      out[6] = (float)floorModD((detailX - driftX) / dP, 1.0);
+      out[7] = (float)floorModD((detailY - driftY) / dP, 1.0);
+      float c = Math.max(0F, Math.min(1F, cover));
+      out[8] = 1F - c;
+      out[9] = 1F / Math.max(0.02F, c * EDGE);
+      out[10] = EROSION;
+      out[11] = Config.CLOUD_OPACITY_PCT / 100F / 0.95021293F;
+      return fieldTex;
+   }
+
    /** The water's field unit: past every unit the water, glint, reflection and composite passes bind (0-15). */
    static final int WATER_FIELD_UNIT = 16;
    private static final java.util.HashMap<Integer, int[]> WATER_LOCATIONS = new java.util.HashMap<>();
