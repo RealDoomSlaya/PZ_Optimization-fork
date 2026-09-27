@@ -1576,6 +1576,14 @@ public abstract class IsoGameCharacter
          return; // pzopt: emitterIdleSkip
       }
 
+      // pzopt: emitterDefer. On a batch task (the slot is only set there, and only with the key on at
+      // dispatch) the FMOD work below queues for the join's game-thread drain instead of running on the
+      // worker: the ticks serialized on the emitter monitors, and the prone branch writes the static
+      // tempVectorBonePos scratch. Same frame, stock's queue order, under the flight's multiplier.
+      if (pzopt.UpdateBatch.deferEmitter(this)) { // pzopt: emitterDefer
+         return; // pzopt: emitterDefer
+      }
+
       // pzopt: emitterParamSkip. Stock recomputes every FMOD parameter of every character every frame (the footstep
       // material walks the square's objects, the zone parameter the room) although a parameter value only goes
       // anywhere through the event instances of this character's own emitter. With no instance running and none about

@@ -187,6 +187,7 @@ PzoptOptionClasses = {
     earlyTilePacks = { "GameWindow" },
     ecsLookupFast = { "ECSComponent", "ECSEntity", "IsoZombie" },
     electricityLevelRange = { "AmbientStreamManager" },
+    emitterDefer = { "pzopt.UpdateBatch" },
     emitterIdleSkip = { "IsoGameCharacter" },
     emitterParamSkip = { "IsoGameCharacter" },
     enabled = { "pzopt.Overrides" },

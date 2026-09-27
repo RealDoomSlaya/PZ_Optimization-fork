@@ -4537,3 +4537,42 @@ cover while a pipeline flight is airborne — no live sighting, watched for.
 ACC_SYNCHRONIZED, the override's seven all do, no strays, method set otherwise identical. No runtime hammer:
 `incrementStatistic` calls into `AchievementManager`, whose initialisation needs platform state a bare JVM
 does not have.
+
+## The batched zombies' emitter ticks land at the join (`emitterDefer`, 2026-09-27; IsoGameCharacter + UpdateBatch)
+
+The pipeline's overlap window held nothing (the lou-pipe-alt wash above): the flight's dear part is the
+zombies' FMOD work serializing on the emitter monitors (the FMODSoundEmitter locks) — worker against worker,
+and against the inline player's combat writes. `updateEmitter` now defers on a batch task: the character
+queues itself on its task's slot (the Lua capture's per-task shape, so queue order = stock's serial order)
+and returns; `joinPending` runs the queued ticks on the game thread right before the Lua replay, under the
+flight's captured multiplier, in the same frame. The idle-skip early-out still runs on the worker (an idle
+zombie never queues); the inline path never defers (the slot is only set on batch tasks, and only when the
+key was on at dispatch); a failed batch still drains what deferred before the throw. A side effect worth its
+own line: the prone-zombie branch of `updateEmitter` writes `CombatManager`'s STATIC `tempVectorBonePos` —
+the scratch-family disease again — and moving the whole tick to the game thread retires that hazard instead
+of converting it.
+
+Key `emitterDefer`, default on (inert without `entityUpdateParallel`). Counters `emitterDeferred` /
+`emitterDrained` on the batch status line. `tests/pzopt/EmitterDeferTest` pins the jar's updateEmitter
+pzopt-free and still on the static bone scratch (a TIS rework re-reads the override), the override routed
+through `deferEmitter`, the join's drain calling the real `updateEmitter`, and the off-task refusal. The
+win claim waits on the alternation rig (the measurement rule above); until that run lands this ships as
+a correctness + contention change, not a numbers claim.
+
+
+Measurements around the deferral (2026-09-27, Windows desktop, 9950X/4090, chunkGridWidth=25, max
+population, 90 s S:300 route at max zoom, the maintainer's own options file):
+
+- The branch's headline pair, back to back on the same route (runs lou-oursoff / lou-ourson, only
+  entityUpdateParallel + animalLosFast flipped, everything else identical): OFF = 12,434 zombies,
+  101.7 ms mean (9.8 fps), p50 86.0, p99 282; ON = 12,139 zombies, 57.7 ms mean (17.3 fps), p50 41.7,
+  p99 206. The median frame halved at twelve thousand zombies; the counts differ 2.4 % in OFF's favour,
+  so the true gap is at most a hair smaller. Zero exceptions on either side.
+- The pipeline alternation runs (lou-defer-alt, lou-defer-alt2) are NOT clean pipeline evidence: the
+  worst windows were GPU bake bursts (230 ms gpu_ms frames landing on whichever window parity the wall
+  clock chose) and the batch counters exposed the real defect — `async helped` ≈ 100 % of batched tasks,
+  i.e. at the join the workers had claimed essentially nothing: the overlap window as built is
+  structurally EMPTY. The join sits at the next bucket's seam, the dominant batch is followed by
+  trivial collections, and the game thread arrives at the join before the workers wake from the gate
+  monitor. The pipeline is currently sync-with-extra-steps; the fix (join at first dependency, workers
+  pre-woken at dispatch) is the next pass, and until it lands no pipeline number is claimed either way.

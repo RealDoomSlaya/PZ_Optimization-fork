@@ -184,6 +184,55 @@ public final class UpdateBatch {
       return new java.util.ArrayList[size];
    }
 
+   // ── Deferred emitter ticks (emitterDefer) ──────────────────────────────────────────────────────────────
+   //
+   // The same per-task slot shape as the Lua capture: a batched zombie reaching updateEmitter queues ITSELF
+   // on its task's slot instead of ticking FMOD on the worker (the ticks serialized on the emitter monitors,
+   // against each other and against the inline player's combat — and the prone branch writes a STATIC bone
+   // scratch). joinPending runs the queued ticks on the game thread in queue order — stock's serial order —
+   // under the flight's captured multiplier. The tick still lands in the same frame, before anything renders.
+   private static java.util.ArrayList<zombie.characters.IsoGameCharacter>[] emitterCaptures = newEmitterCaptureArray(4096);
+   private static final ThreadLocal<java.util.ArrayList<zombie.characters.IsoGameCharacter>> EMITTER_CAPTURE = new ThreadLocal<>();
+   private static long emitterDeferred, emitterDrained;
+
+   @SuppressWarnings("unchecked")
+   private static java.util.ArrayList<zombie.characters.IsoGameCharacter>[] newEmitterCaptureArray(int size) {
+      return new java.util.ArrayList[size];
+   }
+
+   /**
+    * A batch task reached {@code updateEmitter}: queue the character for the join's drain and return true.
+    * Off a batch task (or with {@code emitterDefer} off at dispatch) the slot is unset and the caller runs
+    * the stock body in place — the inline path never defers.
+    */
+   public static boolean deferEmitter(zombie.characters.IsoGameCharacter character) {
+      java.util.ArrayList<zombie.characters.IsoGameCharacter> list = EMITTER_CAPTURE.get();
+      if (list == null) {
+         return false;
+      }
+
+      list.add(character);
+      emitterDeferred++;
+      return true;
+   }
+
+   /** Game thread, after the join: every task's queued emitter ticks through the real updateEmitter, in queue order. */
+   private static void drainEmitters(int n) {
+      for (int i = 0; i < n; i++) {
+         java.util.ArrayList<zombie.characters.IsoGameCharacter> list = emitterCaptures[i];
+         if (list == null || list.isEmpty()) {
+            continue;
+         }
+
+         for (int j = 0; j < list.size(); j++) {
+            list.get(j).updateEmitter(); // EMITTER_CAPTURE is unset on the game thread, so the stock body runs
+            emitterDrained++;
+         }
+
+         list.clear();
+      }
+   }
+
    /**
     * A worker mid-batch reached a {@code triggerEvent} overload (the override calls this from behind its
     * {@link #onWorkerNow} guard): capture the dispatch for the game thread's replay, or count-and-drop when
@@ -455,6 +504,10 @@ public final class UpdateBatch {
       if (luaReplay && luaCaptures.length < n) {
          luaCaptures = java.util.Arrays.copyOf(luaCaptures, Math.max(n, luaCaptures.length * 2));
       }
+      final boolean flightDefer = Config.EMITTER_DEFER;
+      if (flightDefer && emitterCaptures.length < n) {
+         emitterCaptures = java.util.Arrays.copyOf(emitterCaptures, Math.max(n, emitterCaptures.length * 2));
+      }
 
       // The bucket's frame mod, captured at dispatch: the game thread moves on to the next bucket — and
       // rewrites the global perObjectMultiplier — while these tasks still run, so every task reads THIS value
@@ -478,6 +531,15 @@ public final class UpdateBatch {
             }
             LUA_CAPTURE.set(capture); // captureLuaEvent appends here for this task
          }
+         java.util.ArrayList<zombie.characters.IsoGameCharacter> emitterSlot = null;
+         if (flightDefer) {
+            emitterSlot = emitterCaptures[i];
+            if (emitterSlot == null) {
+               emitterSlot = new java.util.ArrayList<>();
+               emitterCaptures[i] = emitterSlot; // published to the game thread by the join
+            }
+            EMITTER_CAPTURE.set(emitterSlot); // deferEmitter queues here for this task
+         }
          try {
             entity.setCurrentSimulationLevel(level);
             entity.preupdate();
@@ -488,6 +550,9 @@ public final class UpdateBatch {
             POM.get()[0] = Float.NaN; // pom() follows the live field again off-task
             if (capture != null) {
                LUA_CAPTURE.set(null);
+            }
+            if (emitterSlot != null) {
+               EMITTER_CAPTURE.set(null);
             }
          }
       }, fx -> flightFailure = fx);
@@ -526,17 +591,19 @@ public final class UpdateBatch {
       // failed batch, so a partially updated frame still lands its tile updates instead of leaking them.
       applyDeferredSquares();
 
-      // The window's captured Lua dispatches, in queue order — stock's serial event order — under the
-      // multiplier the batch dispatched with, so handlers see the same time scale as stock's inline dispatch.
-      // Also after a failed batch: events fired before the throw did fire in stock's semantics too.
-      if (flightLuaReplay) {
-         float[] h = POM.get();
-         h[0] = flightPom;
-         try {
+      // The window's deferred emitter ticks, then its captured Lua dispatches, both in queue order — stock's
+      // serial order — under the multiplier the batch dispatched with, so the ticks and the handlers see the
+      // same time scale as stock's inline run. Also after a failed batch: what deferred before the throw
+      // would have run in stock's semantics too.
+      float[] h = POM.get();
+      h[0] = flightPom;
+      try {
+         drainEmitters(n); // before the replay: a handler reading a zombie's sound state sees the ticked emitter
+         if (flightLuaReplay) {
             replayLuaEvents(n);
-         } finally {
-            h[0] = Float.NaN;
          }
+      } finally {
+         h[0] = Float.NaN;
       }
       Throwable t = flightFailure;
       if (t != null) {
@@ -631,6 +698,7 @@ public final class UpdateBatch {
       return "update batch: frames=" + frames + " batched=" + batched + " max=" + maxBatch
             + " work ms=" + (workNanos / 1_000_000L) + " wait ms=" + (waitNanos / 1_000_000L)
             + " luaCaptured=" + luaCaptured + " luaReplayed=" + luaReplayed
+            + " emitterDeferred=" + emitterDeferred + " emitterDrained=" + emitterDrained
             + " luaSuppressed=" + luaSuppressed.get() + " pathfindRaceSkipped=" + pathfindRaceSkipped.get()
             + " movingSquareDeferred=" + movingSquareDeferred
             + (failed ? " FAILED" : "");
