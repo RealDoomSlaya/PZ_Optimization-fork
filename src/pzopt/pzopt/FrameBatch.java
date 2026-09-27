@@ -132,7 +132,15 @@ public final class FrameBatch {
 
    private static volatile int lastPreClaimed; // spec 3.5 (review finding 7): cursor position at the last join's entry
 
-   /** Tasks the workers had claimed when the last join started — the combined dispatch's runway metric. */
+   /**
+    * Tasks the workers had claimed when the last join started — the combined dispatch's runway metric.
+    *
+    * <p>Per JOIN, not per user. This pool is shared: {@code AnimBatch}, {@code ActionEval}, {@code LightingBatch},
+    * {@code SeparateBatch} and {@code CharDraw} all land through {@link #join()}, several of them later in the same
+    * frame than the entity flight, so the value standing here belongs to whichever batch joined last. A user that
+    * wants ITS number must read this at its own join and keep it: {@code UpdateBatch.joinPending} does, and
+    * {@code UpdateBatch.getPreClaimed()} is the entity flight's own cumulative total.
+    */
    public static int lastPreClaimed() {
       return lastPreClaimed;
    }

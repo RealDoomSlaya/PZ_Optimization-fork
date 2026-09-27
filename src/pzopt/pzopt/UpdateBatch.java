@@ -458,27 +458,50 @@ public final class UpdateBatch {
    private static int inlineCount;
    private static long nestedJoins, combinedFrames, inlineQueued;
 
+   // The runway metric, summed per ENTITY flight instead of read out of FrameBatch when describe() prints.
+   // FrameBatch.lastPreClaimed() is a single value published by whichever join ran last, and the pool is shared:
+   // AnimBatch, LightingBatch, SeparateBatch and CharDraw all dispatch and join through FrameBatch, several of them
+   // LATER in the same frame than this flight — so by print time that number is the animation batch's, not ours, and
+   // the acceptance measurement would be of the wrong batch. joinPending() reads it at THIS flight's join and adds it
+   // here. Cumulative, like batched, so preClaimed / batched is the runway fraction directly: the ~0 of the old
+   // per-bucket shape is the defect, its rise is the combined shape's evidence. Every landing counts, the sync path's
+   // near-zero included — that contribution is the control arm and belongs in the same reading.
+   private static long preClaimed;
+
    // values() allocates a fresh array per call, and the combined runner decodes a level per task — thousands of
    // tasks a frame. The enum is immutable, so one copy for the session.
    private static final UpdateSchedulerSimulationLevel[] LEVELS = UpdateSchedulerSimulationLevel.values();
 
    /**
-    * Scheduler entry, once per frame: latch whether this frame runs the combined shape. Reading the wall
-    * clock (devPipelineAlternate) once here means a window flip can never produce a mixed frame (spec 3.1).
-    * The test seam takes the value directly.
+    * Scheduler entry, once per frame: latch whether this frame runs the combined shape — exactly the value it is
+    * handed, no gate of its own. Reading the wall clock (devPipelineAlternate) once per frame means a window flip can
+    * never produce a mixed frame (spec 3.1). The test seam takes the value directly, which is why the gate lives in
+    * {@link #latchFrameFromConfig()} and not here: with {@code enabled()} folded in, this latched false whatever the
+    * caller asked for whenever the feature was off — a bare JVM is such a case ({@code entityUpdateParallel} defaults
+    * to false, so {@code enabled()} short-circuits there; {@code Overrides.enabled()} itself is true against a built
+    * classpath) — and {@link #combinedFrame()} plus the two resets below were then unreachable from a test.
     */
    public static void latchFrame(boolean combined) {
-      combinedFrame = combined && enabled();
+      combinedFrame = combined;
       if (combinedFrame) {
          clear();
+         // The abandoned inline entities are nulled, not just forgotten: a frame that threw between queueInline and
+         // runInlinePhase leaves its references in the array, and a slot past the new frame's inlineCount is never
+         // overwritten — without this a single dropped frame pins those entities for the rest of the session.
+         java.util.Arrays.fill(inlineQueue, 0, inlineCount, null);
          inlineCount = 0;
          combinedFrames++;
       }
    }
 
-   /** The production latch: enabled() and pipelineOn() read once, at the scheduler's frame entry. */
+   /**
+    * The production latch, and the one owner of the gate: {@link #pipelineOn()} (the key, or the
+    * devPipelineAlternate window) AND {@link #enabled()} (the parallel key, the failure latch, the worker count,
+    * singleplayer, the override build check), both read once here at the scheduler's frame entry. Both are needed —
+    * {@code pipelineOn()} does not imply {@code enabled()}, it reads the pipeline key alone.
+    */
    public static boolean latchFrameFromConfig() {
-      latchFrame(pipelineOn());
+      latchFrame(pipelineOn() && enabled());
       return combinedFrame;
    }
 
@@ -531,6 +554,11 @@ public final class UpdateBatch {
    /** How many times a nested batch user landed the combined flight this session. */
    public static long getNestedJoins() {
       return nestedJoins;
+   }
+
+   /** Tasks the workers had claimed before the game thread reached the join, summed over every entity flight. */
+   public static long getPreClaimed() {
+      return preClaimed;
    }
 
    /** Test seam: undo the failure latch between CombinedDispatchTest sections. */
@@ -839,6 +867,7 @@ public final class UpdateBatch {
       FrameBatch.join(); // runs the completion above on this thread: flightFailure is set past here
       waitNanos += System.nanoTime() - j0; // the game thread's cost of this batch IS the join wait: with the
       // pipeline it did the next bucket's collection instead of task work, so work ms stays ~0 by design
+      preClaimed += FrameBatch.lastPreClaimed(); // THIS flight's runway, taken at its own join — see the field
       inFlight = false;
       int n = flightN;
 
@@ -961,7 +990,7 @@ public final class UpdateBatch {
             + " luaSuppressed=" + luaSuppressed.get() + " pathfindRaceSkipped=" + pathfindRaceSkipped.get()
             + " movingSquareDeferred=" + movingSquareDeferred
             + " combinedFrames=" + combinedFrames + " inlineQueued=" + inlineQueued
-            + " nestedJoins=" + nestedJoins + " preClaimed=" + FrameBatch.lastPreClaimed()
+            + " nestedJoins=" + nestedJoins + " preClaimed=" + preClaimed
             + (failed ? " FAILED" : "");
    }
 }

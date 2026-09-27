@@ -112,9 +112,15 @@ public class CombinedDispatchTest {
       while (System.nanoTime() < busyUntil) {
          Thread.onSpinWait();
       }
+      long preClaimedBefore = UpdateBatch.getPreClaimed();
       UpdateBatch.joinPending();
       Check.check(FrameBatch.lastPreClaimed() > 0,
             "workers claimed tasks before the join (preClaimed=" + FrameBatch.lastPreClaimed() + ") — today's shape never achieves this");
+      // and the flight owns that number itself: FrameBatch's is the last join's, whoever joined last (the shared pool
+      // lands AnimBatch and friends later in the same frame), so the entity flight accumulates its own at its own join
+      Check.check(UpdateBatch.getPreClaimed() - preClaimedBefore == FrameBatch.lastPreClaimed(),
+            "the flight's cumulative counter took THIS join's preClaimed (delta="
+                  + (UpdateBatch.getPreClaimed() - preClaimedBefore) + ", join=" + FrameBatch.lastPreClaimed() + ")");
 
       // ── 4. nested-batch guard: FrameBatch.run with a combined flight pending lands it FULLY first ──
       UpdateBatch.latchFrame(true);
@@ -145,6 +151,40 @@ public class CombinedDispatchTest {
       Check.check(UpdateBatch.hasFailed(), "a worker throw latches batching off");
       Check.check(!UpdateBatch.hasPendingBatch(), "the failed flight still landed");
       UpdateBatch.resetFailedForTest();
+
+      // ── 6. the latch itself: what it stamps and the two queues it resets. Reachable only since the enabled() gate
+      //      moved to latchFrameFromConfig(): with it inside latchFrame, this JVM latched false whatever the caller
+      //      asked (enabled() short-circuits on entityUpdateParallel, which defaults off), so combinedFrame() and
+      //      both resets ran in no test at all. That is why these four lines are new, not the flag ──
+      Probe.ORDER.clear();
+      gt.perObjectMultiplier = 1.0F;
+      UpdateBatch.latchFrame(true);
+      Check.check(UpdateBatch.combinedFrame(), "latchFrame(true) latches the combined frame");
+      UpdateBatch.latchFrame(false);
+      Check.check(!UpdateBatch.combinedFrame(), "latchFrame(false) latches it off");
+
+      // a batchable queued into a frame that then never dispatched: the next latch must drop it, or it flies twice
+      UpdateBatch.latchFrame(true);
+      UpdateBatch.add(new Probe("stale-batch", 0), 0);
+      Check.check(UpdateBatch.pending() == 1, "the abandoned frame left one entity queued");
+      UpdateBatch.latchFrame(true); // the next frame begins; the previous one never reached dispatchCombined
+      Check.check(UpdateBatch.pending() == 0, "latchFrame(true) cleared the abandoned queue");
+      Probe fresh = new Probe("fresh", 0);
+      UpdateBatch.add(fresh, 2);
+      UpdateBatch.dispatchCombined();
+      UpdateBatch.joinPending();
+      Check.check(fresh.sawPom == 1.0F && fresh.sawLevel == 2, "the fresh entity flew under its own pom and level");
+      Check.check(Probe.ORDER.equals(java.util.List.of("fresh")),
+            "the stale entity did not run in the next flight, got " + Probe.ORDER);
+
+      // the inline queue resets the same way, and its abandoned slots are nulled rather than left pinning entities
+      Probe.ORDER.clear();
+      UpdateBatch.latchFrame(true);
+      UpdateBatch.queueInline(new Probe("stale-inline", 0), 0);
+      UpdateBatch.queueInline(new Probe("stale-inline2", 0), 0);
+      UpdateBatch.latchFrame(true); // again: the frame that queued them never ran its inline phase
+      UpdateBatch.runInlinePhase();
+      Check.check(Probe.ORDER.isEmpty(), "latchFrame(true) reset the abandoned inline queue, got " + Probe.ORDER);
 
       System.out.println("CombinedDispatchTest ok");
    }
