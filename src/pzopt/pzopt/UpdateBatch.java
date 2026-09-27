@@ -216,14 +216,22 @@ public final class UpdateBatch {
       return true;
    }
 
-   /** Game thread, after the join: every task's queued emitter ticks through the real updateEmitter, in queue order. */
+   /**
+    * Game thread, after the join: every task's queued emitter ticks through the real updateEmitter, in queue
+    * order. {@code flightPomArr} is set on the combined path — that flight spans every bucket of the frame, so each
+    * tick must land under its own entity's time scale — and null on the sync path, where the flight's single
+    * {@code flightPom} covers every task, as it always did.
+    */
    private static void drainEmitters(int n) {
+      float[] h = POM.get(); // joinPending set it to flightPom already; this is the same holder array
+      final float[] poms = flightPomArr;
       for (int i = 0; i < n; i++) {
          java.util.ArrayList<zombie.characters.IsoGameCharacter> list = emitterCaptures[i];
          if (list == null || list.isEmpty()) {
             continue;
          }
 
+         h[0] = poms != null ? poms[i] : flightPom; // spec 3.5: stock's per-bucket multiplier per entity
          for (int j = 0; j < list.size(); j++) {
             list.get(j).updateEmitter(); // EMITTER_CAPTURE is unset on the game thread, so the stock body runs
             emitterDrained++;
@@ -251,14 +259,20 @@ public final class UpdateBatch {
       list.add(record);
    }
 
-   /** Game thread, after the join: every task's captured events through the real dispatch, in queue order. */
+   /**
+    * Game thread, after the join: every task's captured events through the real dispatch, in queue order, each
+    * under its own entity's multiplier (the combined path's {@code flightPomArr} — see {@link #drainEmitters}).
+    */
    private static void replayLuaEvents(int n) {
+      float[] h = POM.get();
+      final float[] poms = flightPomArr;
       for (int i = 0; i < n; i++) {
          java.util.ArrayList<Object[]> list = luaCaptures[i];
          if (list == null || list.isEmpty()) {
             continue;
          }
 
+         h[0] = poms != null ? poms[i] : flightPom; // spec 3.5: the handlers of this entity's events see its time scale
          luaCaptured += list.size();
          for (int j = 0; j < list.size(); j++) {
             Object[] r = list.get(j);
@@ -422,6 +436,108 @@ public final class UpdateBatch {
       return flightPending;
    }
 
+   // ── combined dispatch (spec 2026-09-27): the whole frame's batchables in one workers-only flight ──
+   //
+   // The per-bucket pipeline overlapped bucket N's flight with bucket N+1's collection, and the overlap window
+   // was measurably empty: the dominant batch is FULL's and the buckets after it are trivial, so `async helped`
+   // was ~100 % of `batched` — the game thread reached the join before the workers woke and did all the work
+   // itself. On a combined frame every bucket only QUEUES: batchables here with their bucket's multiplier and
+   // simulation level stamped at queue time, everything else into the inline queue. After the last bucket the
+   // scheduler dispatches the whole frame at once and runs the inline entities while the flight is airborne —
+   // that game-thread work is the runway — then joins at its tail, before updateZombieVocals().
+   private static boolean combinedFrame; // latched once per frame (scheduler.update entry); never read from the wall clock mid-frame
+   private static float[] queuePom = new float[4096];   // per-entity: its bucket's perObjectMultiplier at add()
+   private static int[] queueLevel = new int[4096];     // per-entity: its bucket's simulationLevel ordinal
+   private static float[] sparePom;                     // double-buffered with the flight, like spareQueue
+   private static int[] spareLevel;
+   private static float[] flightPomArr;                 // the airborne batch's per-task multipliers (replay/drain read these)
+   private static int[] flightLevelArr;
+   private static IsoMovingObject[] inlineQueue = new IsoMovingObject[1024];
+   private static float[] inlinePom = new float[1024];
+   private static int[] inlineLevel = new int[1024];
+   private static int inlineCount;
+   private static long nestedJoins, combinedFrames, inlineQueued;
+
+   // values() allocates a fresh array per call, and the combined runner decodes a level per task — thousands of
+   // tasks a frame. The enum is immutable, so one copy for the session.
+   private static final UpdateSchedulerSimulationLevel[] LEVELS = UpdateSchedulerSimulationLevel.values();
+
+   /**
+    * Scheduler entry, once per frame: latch whether this frame runs the combined shape. Reading the wall
+    * clock (devPipelineAlternate) once here means a window flip can never produce a mixed frame (spec 3.1).
+    * The test seam takes the value directly.
+    */
+   public static void latchFrame(boolean combined) {
+      combinedFrame = combined && enabled();
+      if (combinedFrame) {
+         clear();
+         inlineCount = 0;
+         combinedFrames++;
+      }
+   }
+
+   /** The production latch: enabled() and pipelineOn() read once, at the scheduler's frame entry. */
+   public static boolean latchFrameFromConfig() {
+      latchFrame(pipelineOn());
+      return combinedFrame;
+   }
+
+   /** True while this frame's buckets must queue instead of executing (spec 3.2). */
+   public static boolean combinedFrame() {
+      return combinedFrame;
+   }
+
+   /** Combined add: the entity plus its bucket's multiplier (the live global — the bucket just set it) and level. */
+   public static void add(IsoMovingObject entity, int simulationLevelOrdinal) {
+      if (count == queue.length) {
+         queue = java.util.Arrays.copyOf(queue, count * 2);
+         queuePom = java.util.Arrays.copyOf(queuePom, count * 2);
+         queueLevel = java.util.Arrays.copyOf(queueLevel, count * 2);
+      }
+      if (queuePom.length < queue.length) { // the sync-path add() grew queue alone in an earlier frame
+         queuePom = java.util.Arrays.copyOf(queuePom, queue.length);
+         queueLevel = java.util.Arrays.copyOf(queueLevel, queue.length);
+      }
+
+      queuePom[count] = zombie.GameTime.getInstance().perObjectMultiplier;
+      queueLevel[count] = simulationLevelOrdinal;
+      queue[count++] = entity;
+   }
+
+   /** Combined mode: an inline (non-batchable) entity, deferred to runInlinePhase under the flight (spec 3.4). */
+   public static void queueInline(IsoMovingObject entity, int simulationLevelOrdinal) {
+      if (inlineCount == inlineQueue.length) {
+         inlineQueue = java.util.Arrays.copyOf(inlineQueue, inlineCount * 2);
+         inlinePom = java.util.Arrays.copyOf(inlinePom, inlineCount * 2);
+         inlineLevel = java.util.Arrays.copyOf(inlineLevel, inlineCount * 2);
+      }
+
+      inlinePom[inlineCount] = zombie.GameTime.getInstance().perObjectMultiplier;
+      inlineLevel[inlineCount] = simulationLevelOrdinal;
+      inlineQueue[inlineCount++] = entity;
+      inlineQueued++;
+   }
+
+   /** The nested-batch guard's landing (spec 3.4): full bookkeeping, counted, dev-logged once. */
+   public static void nestedJoin() {
+      nestedJoins++;
+      if (nestedJoins == 1L && Config.DEV) {
+         Log.info("combined dispatch: nested FrameBatch use landed the flight first\n" + stackOf(new Throwable("caller")));
+      }
+
+      joinPending();
+   }
+
+   /** How many times a nested batch user landed the combined flight this session. */
+   public static long getNestedJoins() {
+      return nestedJoins;
+   }
+
+   /** Test seam: undo the failure latch between CombinedDispatchTest sections. */
+   public static void resetFailedForTest() {
+      failed = false;
+   }
+
    private static long altWindow = Long.MIN_VALUE; // devPipelineAlternate: last logged window index
 
    /**
@@ -571,6 +687,145 @@ public final class UpdateBatch {
    }
 
    /**
+    * Combined dispatch (spec 3.3): the whole frame's batchables in one workers-only flight. Each task runs
+    * under ITS entity's simulation level and multiplier (queueLevel/queuePom, stamped at add) instead of one
+    * level and one multiplier for the flight, because this batch spans every bucket of the frame. The snapshot
+    * is sized n + inlineCount + 64 — the walk finished before this call, so the inline count is exact rather
+    * than the pipeline's fixed INLINE_SLACK guess.
+    */
+   public static boolean dispatchCombined() {
+      joinPending();
+      int n = count;
+      if (n == 0) {
+         return false;
+      }
+
+      frames++;
+      batched += n;
+      if (n > maxBatch) {
+         maxBatch = n;
+      }
+
+      snapshotFrame++;
+      int need = n + inlineCount + 64;
+      if (snapX.length < need) {
+         int size = Math.max(need, snapX.length * 2);
+         snapX = new float[size];
+         snapY = new float[size];
+         snapZ = new float[size];
+      }
+      float[] sx = snapX;
+      float[] sy = snapY;
+      float[] sz = snapZ;
+      long frame = snapshotFrame;
+      final IsoMovingObject[] q = queue; // the flight owns THESE three arrays; the next frame collects into the spares
+      final float[] poms = queuePom;
+      final int[] levels = queueLevel;
+      for (int i = 0; i < n; i++) {
+         IsoMovingObject entity = q[i];
+         sx[i] = entity.getX(); // still live here: inFlight is false until the write below
+         sy[i] = entity.getY();
+         sz[i] = entity.getZ();
+         entity.pzoptSnapshotIndex = i;
+         entity.pzoptSnapshotFrame = frame;
+      }
+      snapAppend = n;
+
+      boolean luaReplay = Config.ENTITY_UPDATE_LUA_REPLAY;
+      if (luaReplay && luaCaptures.length < n) {
+         luaCaptures = java.util.Arrays.copyOf(luaCaptures, Math.max(n, luaCaptures.length * 2));
+      }
+      final boolean flightDefer = Config.EMITTER_DEFER;
+      if (flightDefer && emitterCaptures.length < n) {
+         emitterCaptures = java.util.Arrays.copyOf(emitterCaptures, Math.max(n, emitterCaptures.length * 2));
+      }
+      final boolean flightReplay = luaReplay;
+
+      flightFailure = null;
+      inFlight = true; // onWorkerNow() and frozen(): the workers are running this batch's entities from here to joinPending
+      FrameBatch.runAsync(n, i -> {
+         IsoMovingObject entity = q[i];
+         CURRENT.set(entity); // frozen(): this task's entity reads itself live, everyone else frozen
+         POM.get()[0] = poms[i]; // spec 3.3: per-task, not per-flight — this flight spans every bucket of the frame
+         java.util.ArrayList<Object[]> capture = null;
+         if (flightReplay) {
+            capture = luaCaptures[i];
+            if (capture == null) {
+               capture = new java.util.ArrayList<>();
+               luaCaptures[i] = capture; // published to the game thread by the join
+            }
+            LUA_CAPTURE.set(capture); // captureLuaEvent appends here for this task
+         }
+         java.util.ArrayList<zombie.characters.IsoGameCharacter> emitterSlot = null;
+         if (flightDefer) {
+            emitterSlot = emitterCaptures[i];
+            if (emitterSlot == null) {
+               emitterSlot = new java.util.ArrayList<>();
+               emitterCaptures[i] = emitterSlot; // published to the game thread by the join
+            }
+            EMITTER_CAPTURE.set(emitterSlot); // deferEmitter queues here for this task
+         }
+         try {
+            entity.setCurrentSimulationLevel(LEVELS[levels[i]]);
+            entity.preupdate();
+            entity.frameStep();
+            entity.update();
+         } finally {
+            CURRENT.set(null); // a pooled worker must not carry the reference into the next task
+            POM.get()[0] = Float.NaN; // pom() follows the live field again off-task
+            if (capture != null) {
+               LUA_CAPTURE.set(null);
+            }
+            if (emitterSlot != null) {
+               EMITTER_CAPTURE.set(null);
+            }
+         }
+      }, fx -> flightFailure = fx);
+
+      flightArr = q;
+      flightN = n;
+      flightPomArr = poms;
+      flightLevelArr = levels;
+      flightPom = Float.NaN; // scalar unused on the combined path: the drains read flightPomArr per task
+      flightLuaReplay = flightReplay;
+      flightPending = true;
+      // Swap the spares in for the next frame's collection, keeping the invariant the stamped add() relies on:
+      // queuePom / queueLevel are never shorter than queue (a sync-path dispatchAsync recycles the entity array
+      // alone, so the three can arrive here with different lengths).
+      queue = spareQueue != null ? spareQueue : new IsoMovingObject[q.length];
+      queuePom = sparePom != null && sparePom.length >= queue.length ? sparePom : new float[queue.length];
+      queueLevel = spareLevel != null && spareLevel.length >= queue.length ? spareLevel : new int[queue.length];
+      spareQueue = null;
+      sparePom = null;
+      spareLevel = null;
+      count = 0;
+      return true;
+   }
+
+   /**
+    * Game thread, after dispatchCombined (spec 3.4): the frame's inline entities under the flight. Per entry
+    * the stock four calls under its bucket's multiplier (the live global — pom() on the game thread resolves
+    * through it, the POM holder stays NaN here by construction), stampInline publishing its post-update
+    * position into the airborne snapshot. Global back to 1.0 after, stock's guarantee.
+    */
+   public static void runInlinePhase() {
+      zombie.GameTime gt = zombie.GameTime.getInstance();
+      for (int i = 0; i < inlineCount; i++) {
+         IsoMovingObject entity = inlineQueue[i];
+         gt.perObjectMultiplier = inlinePom[i];
+         entity.setCurrentSimulationLevel(LEVELS[inlineLevel[i]]);
+         entity.preupdate();
+         entity.frameStep();
+         entity.update();
+         stampInline(entity);
+      }
+
+      gt.perObjectMultiplier = 1.0F;
+      java.util.Arrays.fill(inlineQueue, 0, inlineCount, null);
+      inlineCount = 0;
+   }
+
+   /**
     * Game thread: wait for the airborne batch, then land its window — deferred tile updates, the Lua replay
     * under ITS dispatch-time multiplier (the game thread's global may already be the next bucket's), the
     * failure latch. No-op without a pending batch.
@@ -596,7 +851,7 @@ public final class UpdateBatch {
       // same time scale as stock's inline run. Also after a failed batch: what deferred before the throw
       // would have run in stock's semantics too.
       float[] h = POM.get();
-      h[0] = flightPom;
+      h[0] = flightPom; // NaN on the combined path: pom() falls through to the live global until a walker sets a task's own
       try {
          drainEmitters(n); // before the replay: a handler reading a zombie's sound state sees the ticked emitter
          if (flightLuaReplay) {
@@ -620,6 +875,10 @@ public final class UpdateBatch {
       java.util.Arrays.fill(flightArr, 0, n, null);
       spareQueue = flightArr; // the next dispatch collects into it
       flightArr = null;
+      sparePom = flightPomArr; // symmetric with the entity array: the combined path recycles all three buffers
+      spareLevel = flightLevelArr; // (both null after a sync-path flight, which never took them)
+      flightPomArr = null;
+      flightLevelArr = null;
       flightPending = false;
    }
 
@@ -701,6 +960,8 @@ public final class UpdateBatch {
             + " emitterDeferred=" + emitterDeferred + " emitterDrained=" + emitterDrained
             + " luaSuppressed=" + luaSuppressed.get() + " pathfindRaceSkipped=" + pathfindRaceSkipped.get()
             + " movingSquareDeferred=" + movingSquareDeferred
+            + " combinedFrames=" + combinedFrames + " inlineQueued=" + inlineQueued
+            + " nestedJoins=" + nestedJoins + " preClaimed=" + FrameBatch.lastPreClaimed()
             + (failed ? " FAILED" : "");
    }
 }

@@ -103,6 +103,7 @@ public final class FrameBatch {
     * flight and the one-batch-at-a-time rule of the workers holds. {@code done} runs on the game thread at the join.
     */
    public static void runAsync(int n, Runner r, Completion done) {
+      landEntityFlight(); // spec 3.4: a nested batch under a combined flight lands it through UpdateBatch, not join()
       join();
       if (n <= 0) {
          done.done(null);
@@ -128,6 +129,37 @@ public final class FrameBatch {
    }
 
    public static long helped; // tasks of an asynchronous batch the game thread ran while waiting for one (helpOne)
+
+   private static volatile int lastPreClaimed; // spec 3.5 (review finding 7): cursor position at the last join's entry
+
+   /** Tasks the workers had claimed when the last join started — the combined dispatch's runway metric. */
+   public static int lastPreClaimed() {
+      return lastPreClaimed;
+   }
+
+   /**
+    * The combined dispatch's nested-batch guard (spec 3.4): a batch user reached from an inline entity's update
+    * while the frame's own entity flight is airborne lands that flight FULLY first — the squares, the emitter and
+    * Lua drains, the snapshot window, the failure latch. A raw {@link #join()} here would strip all of it, and two
+    * batches in flight break the one-batch rule the workers are built on.
+    *
+    * <p>The existing {@code running} check cannot stand in for this: {@code running} is false for the whole combined
+    * flight ({@link #runAsync} returns at once) and false again during the inline phase, which is exactly the window
+    * the guard exists for.
+    *
+    * <p>It fires only from a thread that may join at all. From a {@link Worker} — or from the game thread while it
+    * is working a batch task, which is the same situation — the join would wait for {@code finished == count},
+    * a count that includes the caller's own unfinished task: it would wait for itself. Such a re-entrant call is
+    * this class's pre-existing hazard (today {@code run} throws on it through {@code running}, and {@code runAsync}
+    * would hang in {@code join}); the guard deliberately leaves that behaviour untouched instead of adding a
+    * deadlock of its own. The fast path is one plain boolean load, so the thread test is never reached in a frame
+    * without a combined flight.
+    */
+   private static void landEntityFlight() {
+      if (UpdateBatch.hasPendingBatch() && !(Thread.currentThread() instanceof Worker) && !UpdateBatch.onBatchTaskNow()) {
+         UpdateBatch.nestedJoin();
+      }
+   }
 
    /**
     * Game thread, while waiting for a task of the asynchronous batch: claim the next task no worker has started and run
@@ -169,6 +201,7 @@ public final class FrameBatch {
       pendingDone = null;
       long t0 = System.nanoTime();
       int before = batch.cursor.get();
+      lastPreClaimed = Math.max(before, 0); // pzopt spec 3.5: the fix's acceptance number — tasks the workers claimed before this join
       batch.work();
       if (before < batch.count) {
          asyncHelped += batch.count - Math.max(before, 0);
@@ -190,6 +223,7 @@ public final class FrameBatch {
     * exception a task threw (null when every task finished).
     */
    public static Throwable run(int n, Runner r) {
+      landEntityFlight(); // spec 3.4: a nested batch under a combined flight lands it through UpdateBatch, not join()
       if (n <= 0) {
          return null;
       }
@@ -228,6 +262,13 @@ public final class FrameBatch {
    }
 
    private static void start() {
+      // Force CorePlacement's class initialization HERE, on the calling thread. Every worker's first act is
+      // CorePlacement.background(), so without this the first worker to arrive runs that <clinit> (Config, the JMX
+      // thread bean: 17 ms measured in a bare JVM) while the other fourteen queue on the class-init lock, and the
+      // pool's first batch runs almost entirely on the caller — with the combined dispatch that is a whole frame of
+      // zombies serialized. Free in the game, where the frame limiter has called onStep since boot; active() has no
+      // side effect, unlike background(), which would put the CALLING thread on the efficient cores on macOS.
+      CorePlacement.active();
       workers = new Thread[THREADS];
       for (int k = 0; k < THREADS; k++) {
          Thread t = new Worker(FrameBatch::workerLoop, "pzopt-frame-" + k);
