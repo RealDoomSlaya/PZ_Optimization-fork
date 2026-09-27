@@ -1105,6 +1105,7 @@ public final class UpdateBatch {
 
    private static final java.util.concurrent.atomic.AtomicLong luaSuppressed = new java.util.concurrent.atomic.AtomicLong();
    private static final java.util.concurrent.atomic.AtomicLong pathfindRaceSkipped = new java.util.concurrent.atomic.AtomicLong();
+   private static final java.util.concurrent.atomic.AtomicLong surfacePropertyRaceSkipped = new java.util.concurrent.atomic.AtomicLong();
 
    /**
     * A worker mid-batch reached {@code LuaEventManager.triggerEvent} and the override's guard turned the dispatch
@@ -1140,6 +1141,27 @@ public final class UpdateBatch {
       return pathfindRaceSkipped.get();
    }
 
+   /**
+    * {@code PropertyContainer.initSurface}'s entry walk read a tile-property alias index outside the alias map's
+    * range and skipped that entry rather than throwing. The walk reads the backing trove map's state byte, its key
+    * and its value separately, so while another thread clears and refills the container — stock's
+    * {@code IsoGridSquare.RecalcProperties}, which chunk streaming calls from its own threads — a state byte that
+    * still says FULL can be paired with the map's no-entry key or value, both -1 for a property container, because
+    * trove writes the no-entry key into the key array BEFORE the state byte stops saying FULL. Stock handed that
+    * index straight to the alias list: the live Louisville route died on {@code Index -1 out of bounds for length
+    * 235} three seconds in and the throw latched batching off for the whole session. The condition is transient —
+    * the entry contributes nothing this time and the next call re-derives the value off an untorn view — so the
+    * count is the only report; it is on {@link #describe}.
+    */
+   public static void onSurfacePropertyRaceSkipped() {
+      surfacePropertyRaceSkipped.incrementAndGet();
+   }
+
+   /** How many torn surface-property entries the alias-range guard has skipped this session. */
+   public static long getSurfacePropertyRaceSkippedCount() {
+      return surfacePropertyRaceSkipped.get();
+   }
+
    public static String describe() {
       return "update batch: frames=" + frames + " batched=" + batched + " max=" + maxBatch
             + " work ms=" + (workNanos / 1_000_000L) + " wait ms=" + (waitNanos / 1_000_000L)
@@ -1148,6 +1170,7 @@ public final class UpdateBatch {
             + " ballisticsDeferred=" + ballisticsDeferred + " ballisticsDrained=" + ballisticsDrained
             + " ragdollDeferred=" + ragdollDeferred + " ragdollDrained=" + ragdollDrained
             + " luaSuppressed=" + luaSuppressed.get() + " pathfindRaceSkipped=" + pathfindRaceSkipped.get()
+            + " surfacePropertyRaceSkipped=" + surfacePropertyRaceSkipped.get()
             + " movingSquareDeferred=" + movingSquareDeferred
             + " combinedFrames=" + combinedFrames + " inlineQueued=" + inlineQueued
             + " nestedJoins=" + nestedJoins + " preClaimed=" + preClaimed

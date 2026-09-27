@@ -25,7 +25,7 @@ public final class PropertyContainer extends TShortShortHashMap {
    private short[] keyArray;
    public static List<Object> sorted = Collections.synchronizedList(new ArrayList<>());
    private byte surface;
-   private byte surfaceFlags;
+   private volatile byte surfaceFlags; // pzopt: the done flag is published last, so it has to carry the happens-before for the six values beside it (a plain store gives a reader none); free on the read path on x86, one fence per publish and per invalidation
    private short stackReplaceTileOffset;
    private byte itemHeight;
    private IsoDirections slopedSurfaceDirection;
@@ -225,34 +225,44 @@ public final class PropertyContainer extends TShortShortHashMap {
 
    private void initSurface() {
       if ((this.surfaceFlags & 1) == 0) {
-         this.surface = 0;
-         this.stackReplaceTileOffset = 0;
-         this.surfaceFlags = 1;
-         this.itemHeight = 0;
-         this.slopedSurfaceDirection = null;
-         this.slopedSurfaceHeightMin = 0;
-         this.slopedSurfaceHeightMax = 0;
+         pzopt.SurfaceInit s = pzopt.SurfaceInit.scratch(); // pzopt: the walk accumulates off the object, stock set the done flag here and filled the fields afterwards — a second thread saw "done" over the reset defaults
          if (pzopt.Config.PROPERTY_SURFACE_NOALLOC) { // pzopt: forEachEntry's own loop without the capturing lambda (C1 allocates one per call)
             byte[] states = this._states; // pzopt
             short[] keys = this._set; // pzopt
             short[] values = this._values; // pzopt
             for (int k = keys.length; k-- > 0; ) { // pzopt: same order as forEachEntry
                if (states[k] == 1) { // pzopt: FULL
-                  this.pzoptSurfaceEntry(keys[k], values[k]); // pzopt
+                  this.pzoptSurfaceEntry(keys[k], values[k], s); // pzopt
                } // pzopt
             } // pzopt
          } else { // pzopt
             this.forEachEntry((i, i1) -> { // pzopt
-               this.pzoptSurfaceEntry(i, i1); // pzopt
+               this.pzoptSurfaceEntry(i, i1, s); // pzopt
                return true; // pzopt
             }); // pzopt
          } // pzopt
+         this.surface = s.surface; // pzopt: one publish at the end, identical values to stock's in-walk writes
+         this.stackReplaceTileOffset = s.stackReplaceTileOffset; // pzopt
+         this.itemHeight = s.itemHeight; // pzopt
+         this.slopedSurfaceDirection = s.slopedSurfaceDirection; // pzopt
+         this.slopedSurfaceHeightMin = s.slopedSurfaceHeightMin; // pzopt
+         this.slopedSurfaceHeightMax = s.slopedSurfaceHeightMax; // pzopt
+         this.surfaceFlags = (byte)(s.flags | 1); // pzopt: the done flag LAST, in the same store as the accumulated bits (stock OR-ed each bit into the field, a read-modify-write that loses one when two walks overlap); volatile, so a reader seeing it set sees the six writes above
       }
    }
 
-   private void pzoptSurfaceEntry(short i, short i1) { // pzopt: the former lambda body of initSurface
-            TileProperty p = (TileProperty)TilePropertyAliasMap.instance.properties.get(i);
+   private void pzoptSurfaceEntry(short i, short i1, pzopt.SurfaceInit s) { // pzopt: the former lambda body of initSurface, writing the accumulator instead of the fields
+            List<TileProperty> all = TilePropertyAliasMap.instance.properties; // pzopt: hoisted for the range guard below
+            if (i < 0 || i >= all.size()) { // pzopt: a torn view of the map paired a FULL state byte with the no-entry key (-1 here); stock handed it to the list and the live route died on "Index -1 out of bounds for length 235"
+               pzopt.UpdateBatch.onSurfacePropertyRaceSkipped(); // pzopt
+               return; // pzopt: transient, the next call re-derives the value off an untorn view
+            } // pzopt
+            TileProperty p = (TileProperty)all.get(i); // pzopt: through the hoisted list
             String key = p.propertyName;
+            if (i1 < 0 || i1 >= p.possibleValues.size()) { // pzopt: the value half of the same torn read (the no-entry value is -1 too)
+               pzopt.UpdateBatch.onSurfacePropertyRaceSkipped(); // pzopt
+               return; // pzopt
+            } // pzopt
             String val = (String)p.possibleValues.get(i1);
             switch (key) {
                case "Surface":
@@ -260,24 +270,24 @@ public final class PropertyContainer extends TShortShortHashMap {
                      try {
                         int pixels = Integer.parseInt(val);
                         if (pixels >= 0 && pixels <= 127) {
-                           this.surface = (byte)pixels;
+                           s.surface = (byte)pixels; // pzopt
                         }
                      } catch (NumberFormatException var11) {
                      }
                   }
                   break;
                case "IsSurfaceOffset":
-                  this.surfaceFlags = (byte)(this.surfaceFlags | 2);
+                  s.flags = (byte)(s.flags | 2); // pzopt
                   break;
                case "IsTable":
-                  this.surfaceFlags = (byte)(this.surfaceFlags | 4);
+                  s.flags = (byte)(s.flags | 4); // pzopt
                   break;
                case "IsTableTop":
-                  this.surfaceFlags = (byte)(this.surfaceFlags | 8);
+                  s.flags = (byte)(s.flags | 8); // pzopt
                   break;
                case "StackReplaceTileOffset":
                   try {
-                     this.stackReplaceTileOffset = (short)Integer.parseInt(val);
+                     s.stackReplaceTileOffset = (short)Integer.parseInt(val); // pzopt
                   } catch (NumberFormatException var10) {
                   }
                   break;
@@ -285,19 +295,19 @@ public final class PropertyContainer extends TShortShortHashMap {
                   try {
                      int pixels = Integer.parseInt(val);
                      if (pixels >= 0 && pixels <= 127) {
-                        this.itemHeight = (byte)pixels;
+                        s.itemHeight = (byte)pixels; // pzopt
                      }
                   } catch (NumberFormatException var9) {
                   }
                   break;
                case "SlopedSurfaceDirection":
-                  this.slopedSurfaceDirection = IsoDirections.fromString(val);
+                  s.slopedSurfaceDirection = IsoDirections.fromString(val); // pzopt
                   break;
                case "SlopedSurfaceHeightMin":
-                  this.slopedSurfaceHeightMin = (byte)PZMath.clamp(PZMath.tryParseInt(val, 0), 0, 100);
+                  s.slopedSurfaceHeightMin = (byte)PZMath.clamp(PZMath.tryParseInt(val, 0), 0, 100); // pzopt
                   break;
                case "SlopedSurfaceHeightMax":
-                  this.slopedSurfaceHeightMax = (byte)PZMath.clamp(PZMath.tryParseInt(val, 0), 0, 100);
+                  s.slopedSurfaceHeightMax = (byte)PZMath.clamp(PZMath.tryParseInt(val, 0), 0, 100); // pzopt
             }
 
    } // pzopt

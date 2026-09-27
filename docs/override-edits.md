@@ -4748,3 +4748,78 @@ hitbox update still native and still fed from the shared static buffer, both ove
 new helpers, the join draining both ahead of the Lua replay, each drain calling the real work, the
 off-task refusals, and the key's default. No performance number is claimed: work moved from the workers
 to the game thread, which is a cost, and the reason to pay it is that the alternative is a dead process.
+
+## The surface properties published once, a torn alias index skipped (`entityUpdateParallel`, 2026-09-27; PropertyContainer + UpdateBatch)
+
+A Louisville horde route with a radius-150 sound pulling the horde in threw an index-out-of-bounds about
+three seconds into the route: index -1 into a list of 235, out of the tile-property alias lookup at the top
+of the surface walk, reached from a worker's falling update through the height-above-floor test and the
+square's sloped-surface question. Nothing crashed — the batch's failure latch caught it, reported it once
+and turned batching off — but that is the expensive part: the rest of the session ran the stock serial
+loop, so a run that was there to measure the parallel path measured the fallback instead. Both defects
+behind it are stock's own lazy-init shape, not something the batch introduced; the batch only supplied the
+second thread that makes them reachable, and the same second thread has always existed in the shape of
+chunk streaming.
+
+The first defect is that the done flag was published before the work. The lazy init is guarded by one bit
+of the surface flag byte, and stock set that byte at the top of the block — before the entry walk fills the
+surface height, the stack-replace offset, the item height and the three sloped-surface values. A second
+thread entering the guard while the first is mid-walk therefore returns immediately and reads fields that
+are still at the values the block reset them to a few instructions earlier: a square that has a sloped
+surface answers that it has none, and one that is a table answers that it is not. That is a silent
+wrong-value bug rather than the crash, and it had no report of its own; it was found reading the code the
+crash pointed at.
+
+The second defect is that the walk takes a torn view of the backing map. A property container is a
+primitive short-to-short hash map whose occupancy, keys and values live in three parallel arrays, and the
+walk reads a state byte, then the key, then the value, one array at a time. The library writes the map's
+no-entry key into the key array *before* the state byte stops saying occupied, on a removal and on a clear
+alike, and a property container's no-entry key and no-entry value are both -1. So a walker holding a state
+byte that still says occupied can read a key of -1 and hand it to the alias list, which is exactly the
+index and exactly the list the crash carried. The mutator is stock's own square property recalculation,
+which clears the container and refills it from the square's objects, and which chunk streaming calls from
+its own threads as well as the game thread calling it for every door, window, fire, corpse and vehicle
+impact. A rehash is the other way to tear the view, but a freshly allocated key array is zero-filled, so a
+key read across a rehash comes out as a valid index — silently wrong, never -1. Our no-allocation walk and
+the stock lambda walk it replaced are equally exposed: the library's own entry walk hoists the same three
+arrays into locals in the same order and reads the same three slots per entry, so this is not a window our
+edit opened or widened.
+
+The fix for the first defect is to compute into a scratch accumulator and publish once. The walk fills a
+per-thread scratch object with the six values and the flag bits, and the block then assigns the six fields
+and writes the flag byte last, with the valid bit and the accumulated bits in one store. Two threads may
+both do the work, which is harmless because it is idempotent and they derive the same values from the same
+entries, but no thread can observe the flag over unfilled fields. The flag bits used to be OR-ed into the
+field from inside the per-entry handler, a read-modify-write that loses a bit when two walks overlap;
+accumulated and stored once they cannot. Nothing in the single-threaded case changes: the final values are
+the same, and the only visible difference is that a throw inside the walk now leaves the flag clear so the
+next call retries, where stock left it set over half-filled fields.
+
+Publishing last only orders the writes for the thread doing them; a reader of a plain field can still be
+handed a stale value, so the flag byte is volatile. That buys the ordering as a real happens-before for the
+price of a compiler barrier on the read path, which is free on x86 and a load-acquire on Apple silicon, and
+one fence per publish and per invalidation. It is viable here because the field is private and used only
+inside the class, which also means no method's bytecode changes — a field's volatility is not part of any
+instruction — so the parity audit still compares every unedited method of the class against the jar's, and
+the structural signature check never saw the field at all.
+
+The fix for the second defect is to refuse an out-of-range alias index instead of throwing on it. The
+per-entry handler now skips an entry whose property index falls outside the alias list, and likewise one
+whose value index falls outside that property's value list, since the value array tears the same way. A
+torn read is a transient condition — the entry contributes nothing this time and the next call re-derives
+the value off an untorn view — and turning it into an exception is what cost a whole session's
+measurements. Skipping silently would be worse than either, so each skip counts on the batch status line
+beside the pathfinding-race count, under its own name.
+
+`tests/pzopt/SurfaceInitTest` pins all of it. Two pins are bytecode: the jar's init writes the flag third
+of seven and ours writes it last and exactly once, and the jar's field is plain while ours is volatile, so
+a rework by the developers fails the build rather than quietly un-fixing this; a third asserts the
+per-entry handler writes none of the container's own fields. The torn-entry cases build the exact array
+state a removal and a clear leave behind — an occupied state byte over a -1 key, over a key past the end of
+the alias list, and over a -1 value — and assert the walk skips it, counts it once and still derives every
+other property correctly. The publication case is one-sided by construction: with the publish-last shape in
+place a reader can only ever see the flag together with the values it was published with, so the test cannot
+fail for a timing reason, while against the old shape three readers against one invalidator catch the flag
+over the reset defaults immediately. No performance number is claimed; the change adds a scratch reset and
+a fence to a path that runs once per container per invalidation, and the reason to pay it is that the
+alternative is a session that silently stops measuring what it was launched to measure.
