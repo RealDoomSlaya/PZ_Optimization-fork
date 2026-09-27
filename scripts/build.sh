@@ -166,7 +166,12 @@ done < <(cd "$BUILD/stock" && find . -name '*.class' | sed 's|^\./||' | sort)
 # Structural check: every member other game classes can link against
 # (everything but private) must still exist with the same descriptor in our
 # build. Added members are fine; removed or changed ones would break linking.
-sig() { javap -p -cp "$1" "$2" 2>/dev/null | grep -vE '^\s*(private|Compiled from|})' | grep -v 'lambda\$' | sort; }
+# `synchronized` is an implementation attribute (ACC_SYNCHRONIZED), not part of a member's linkage, so javap
+# printing it must not read as a changed signature: the locked FMODSoundEmitter and StatisticsManager methods
+# otherwise fail this check as "stock members missing or changed" on a clean tree (reported on PR #35, where
+# all 20 FMODSoundEmitter members showed as SIGNATURE MISMATCH on Linux). The locked sets themselves are
+# pinned at the bytecode level by EmitterDeferTest and StatisticsLockTest.
+sig() { javap -p -cp "$1" "$2" 2>/dev/null | grep -vE '^\s*(private|Compiled from|})' | grep -v 'lambda\$' | sed -E 's/ synchronized / /' | sort; }
 for c in "${OVERRIDES[@]}"; do
   cls="${c//\//.}"
   missing_members=$(comm -23 <(sig "$BUILD/stock" "$cls") <(sig "$OUT" "$cls"))
