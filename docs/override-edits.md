@@ -4578,6 +4578,91 @@ population, 90 s S:300 route at max zoom, the maintainer's own options file):
   pre-woken at dispatch) is the next pass, and until it lands no pipeline number is claimed either way.
 
 
+## The combined dispatch: the pipeline's window made real (`entityUpdatePipeline`, 2026-09-27; UpdateBatch + FrameBatch, bucket and scheduler overrides)
+
+The measurement above named the defect: `async helped` was about 100 % of `batched`, so at the join the
+workers had claimed essentially nothing and the game thread ran the whole batch itself. The pipeline as
+built joined at the *next* bucket's seam, the dominant batch is the fully simulated bucket's, and the
+buckets after it are trivial collections, so the game thread reached the join before the workers woke from
+the gate monitor. The overlap window was not small, it was structurally empty, and the feature was
+synchronous with extra bookkeeping.
+
+What the frame does now on a pipeline frame. The scheduler latches the frame's shape once, at its entry,
+and that latch is the only place the wall clock is read: with the alternation rig a window flip now lands on
+a frame boundary instead of leaving one frame's early buckets queued while its late buckets execute. Every
+bucket then only collects. A batchable entity is queued together with its own simulation level and its own
+per-object multiplier, both taken at queue time, because one flight now spans every bucket of the frame and
+the single dispatch-time scalar the old shape captured is no longer meaningful. An entity that is not
+batchable -- the player, animals, vehicles, physics objects -- goes into a second queue instead of running
+in the loop. After the last bucket the scheduler dispatches all of the frame's batchables as one
+workers-only flight, and then runs that second queue on the game thread while the flight is airborne, each
+entity under the multiplier its own bucket had and in the order the walk found it. That game-thread work is
+the runway: it is the only reason a worker can have claimed anything by the time the join runs. The join
+stays at the scheduler tail, ahead of the postupdate loop and the zombie vocal walk, which is the frame's
+first reader of every zombie.
+
+The whole tail sits in a `finally`, and the join sits in a `finally` inside it. Two failures drove that. A
+bucket that throws must not cost the frame the work already queued -- in the old shape the entities of the
+buckets before the throw had already run, and silently skipping the player's update for a frame is not an
+acceptable translation of that. And an inline entity that throws -- a player update running Lua is the most
+likely thrower in the method -- must not leave a flight airborne, because the vocal walk immediately after
+reads every zombie. The exception still propagates; only the landing is made unconditional.
+
+The landing itself became per task. The deferred emitter ticks and the replayed Lua events are still drained
+on the game thread in queue order, but each entity's are now drained under that entity's own multiplier
+rather than the flight's, which on this shape would be meaningless. The snapshot window is sized from the
+counted inline queue plus a small margin instead of the old fixed guess, since the walk has finished before
+the dispatch and the count is exact.
+
+A nested batch is the one reentrancy the shape invites: an inline entity's update can reach code that itself
+uses the frame pool, and the pool runs one batch at a time. Both pool entry points now land the entity
+flight first, through the full landing rather than a bare join, so the deferred tile updates, the drains, the
+replay and the failure latch are not skipped. It has to sit ahead of the pool's own in-progress check, which
+cannot stand in for it: that flag is false for the whole combined flight and false again during the inline
+phase, which is exactly the window the guard exists for. It deliberately does not fire from a worker, nor
+from the game thread while it is working a batch task, because the join there would wait for a count that
+includes the caller's own unfinished task -- that reentrancy is the pool's pre-existing hazard and the guard
+leaves it exactly as it was instead of converting it into a deadlock.
+
+Two findings fell out of building it. The pool's very first batch of a session ran almost entirely on the
+calling thread, because every worker's first act is the core-placement call and the first worker to arrive
+paid that class's initialization -- seventeen milliseconds, measured -- while the others queued on the
+class-init lock. The pool now forces that initialization on the calling thread when it starts the workers;
+in the game it is free, since the frame limiter has made the same call since boot. And the runway metric had
+to be attributed rather than read: the pool is shared with the animation, lighting, separation and character
+draw batches, several of which join later in the same frame, so the pool's last-join value belongs to
+whichever batch joined last. The entity path now accumulates its own total at its own join.
+
+Key `entityUpdatePipeline`, unchanged in name and still inert without `entityUpdateParallel`. The old
+per-bucket asynchronous dispatch has no caller left; the method stays one release, as the synchronous
+shape still reaches it, and the synchronous per-bucket path is byte-for-byte the rig's control arm. New
+counters on the batch status line: `combinedFrames`, `inlineQueued`, `nestedJoins`, and `preClaimed` --
+the tasks the workers had claimed when the join started, summed per flight. `preClaimed` is the acceptance
+number for this change, and `batched` minus `preClaimed` is this path's own async-helped total, which is
+the quantity whose near-equality with `batched` was the defect; the pool's global `async helped` line is
+shared with the other batches and must not be used for it.
+
+`tests/pzopt/CombinedDispatchTest` pins the machinery at runtime on real moving objects: per-entity
+multiplier and level across two queued groups in one flight, the inline queue's order and per-group
+multiplier with the global restored to one afterwards, the latch's own semantics including that it drops a
+queue left over from a frame that never dispatched, the nested guard landing the flight fully and counting
+it, a throwing task still latching the batching off with the frame still landed, and -- the assertion the
+whole change exists for -- that after a dispatch followed by three milliseconds of game-thread work the
+workers had claimed tasks before the join, which the old shape never achieved. `tests/pzopt/PipelineTest`
+pins the new seam in bytecode: the bucket defers inline entities and no longer dispatches, the synchronous
+per-bucket path survives, and the scheduler latches once and then dispatches, runs the inline phase and
+joins.
+
+One exposure is worth stating plainly rather than burying. The player now updates concurrently with every
+zombie of the frame, where the per-bucket shape overlapped it only with the previous bucket's. The position
+snapshot covers the coordinate reads; any other read from the player into a zombie is newly concurrent over
+a wider set. The feature is opt-in and off by default, and the alternation rig is how that gets watched.
+
+No performance number is claimed here. The change is a shape change with a metric attached, and until an
+alternation run reports a non-zero `preClaimed` with its zombie counts and its processor-bound windows
+separated from its graphics-bound ones, this entry stands as a correctness and structure change only.
+
+
 ## Bullet stays off the workers (`physicsDefer`, 2026-09-27; IsoGameCharacter + IsoZombie + UpdateBatch)
 
 With `entityUpdateParallel` on, shooting zombies killed the game. Not an exception, not a latched-off
