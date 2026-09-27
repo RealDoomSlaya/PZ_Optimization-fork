@@ -4576,3 +4576,90 @@ population, 90 s S:300 route at max zoom, the maintainer's own options file):
   trivial collections, and the game thread arrives at the join before the workers wake from the gate
   monitor. The pipeline is currently sync-with-extra-steps; the fix (join at first dependency, workers
   pre-woken at dispatch) is the next pass, and until it lands no pipeline number is claimed either way.
+
+
+## Bullet stays off the workers (`physicsDefer`, 2026-09-27; IsoGameCharacter + IsoZombie + UpdateBatch)
+
+With `entityUpdateParallel` on, shooting zombies killed the game. Not an exception, not a latched-off
+batch: the process died, twice out of two runs, and it was the maintainer firing a gun on a normal route
+that found it. The crash file names the native frame at the top — the overlapping-pair cache of the
+physics library removing a pair — and under it, on a batch worker thread, the Java frames that led there:
+a character's ballistics target being taken out of the physics world from inside the character's own
+update, which the batch was running on that worker. The benchmark routes never fire a weapon, which is
+the whole reason this survived into a pull request: the feature's own measurements cannot reach the bug.
+
+The hitbox path is not exotic. Whenever a gun is aimed, the combat code gives every character in the
+aim cone a ballistics target, and from then on each of those characters pushes that target into the
+physics engine once per frame from its update: into the world on the first frame, then its axis, then its
+position, then its whole skeleton, and out of the world again when the target expires. That is five
+native entry points, all of them reached from the one call at the top of a character's internal update.
+With the batch on, a dozen workers make those calls while the game thread makes its own for the player,
+the vehicles and the bullets. The engine was never written for that, and the failure mode is a segfault
+rather than an exception, so our failure latch — which turns batching off for the session when an entity
+throws — cannot see it, let alone recover from it. A crash that the safety net structurally cannot catch
+is not a tuning question.
+
+Locking our side of the call would not have been enough either, which is the second half of why this had
+to be a deferral. The skeleton push does not hand the engine a per-target buffer: it fills one public
+static float array shared by every character in the game and passes that. The target's own initialisation
+replaces that array with a longer one when a taller skeleton turns up, mid-fill as far as any other
+thread is concerned, and the game thread writes the same array when the combat code first registers a
+target. Two workers filling it at once, or one worker filling it while it is being replaced, is memory
+corruption regardless of what the native does with threads. Deferring is what fixes that, because the
+game-thread side of it only ever runs on the game thread.
+
+So on a batch task the character's hitbox update queues instead of running, and the game thread makes the
+call at the join, in queue order, in the same frame. The queue entry is taken only when the character
+actually has a target — the check was already the first thing the method did, and keeping the deferral
+behind it is what stops twelve thousand zombies from queueing an entry a frame for a target almost none
+of them have. Reading that field without a lock is safe here for a plain reason: a reference read cannot
+tear, so a worker sees either nothing (and the target, created this frame by the shot, updates one frame
+later) or a valid target (and the game thread re-reads the field at the drain anyway, so a target
+released in between is simply not updated).
+
+One behaviour difference, worth stating plainly rather than burying: stock makes this call at the top of
+the character's update, before the character moves; the join makes it after. The hitbox therefore sits at
+the zombie's post-move position instead of its pre-move one. That is a fraction of a tile, and it is
+arguably the more correct of the two — you are shooting at where the zombie is, not where it was — but it
+is a real change and anyone chasing a hit-registration report should know it is there. Nothing else
+moves: the animator writes the pose during postupdate, and the join happens before postupdate, so the
+deferred call reads exactly the pose the inline call would have read.
+
+The second escape is rarer and was not what crashed, but it is the same hazard and shipping a fix for one
+of them would have been dishonest. A zombie in ragdoll asks its ragdoll controller to test whether it is
+touching a vehicle, and that test both writes ragdoll body dynamics into the engine — through another
+static parameter array — and walks a vehicle's collision geometry, a vehicle the game thread may be
+updating at that moment, since vehicles are one of the types the batch keeps inline. It needs a
+ragdolling zombie in contact with a car to fire at all, which is why nobody had seen it. It defers the
+same way, with one difference: the call takes the vehicle as well as the zombie, and the zombie's update
+clears its vehicle field a few lines further down, so the vehicle reference travels with the queue entry
+instead of being read again at the drain. The controller, by contrast, is re-read on the game thread: if
+the rest of the frame released the ragdoll there is nothing left to tell the engine, and the drain simply
+skips that entry. At the join the vehicles have already finished updating, so this call is if anything
+better placed than it was.
+
+Both queues sit on one per-task slot under one key, drained at the join in the order they have inside a
+single zombie's update — the vehicle contact test first, since it runs above the point where the zombie's
+update reaches its character update, and the hitbox second — and both before the Lua replay, so no handler
+of a captured event can observe a hitbox that is still where the zombie stood last frame. The slot is set
+only on a batch task and only when the key was on at dispatch, so the game thread and the inline path
+never defer and the drain runs the real work with the slot unset. A batch that failed still drains what
+was queued before the throw, exactly as the emitter drain does.
+
+Everything else we could find stays where it was. All five hitbox natives and both ragdoll-dynamics
+natives are now unreachable from a worker; every other physics call in the game belongs to the vehicles,
+the chunk collision meshes, the world simulation step or the rest of the ragdoll pipeline, and those run
+on the game thread — the ragdoll simulation in particular runs from postupdate, after the join. One
+theoretical hole is left open deliberately: a character with an aimed firearm raised also updates its own
+ballistics controller from its update, and that reaches the engine too, but a vanilla zombie never holds
+an aimed firearm and never aims, and zombies are the only characters the batch takes. A mod that arms
+zombies would reopen it, and that is the line to re-read first if one ever reports a crash here.
+
+Key `physicsDefer`, default on and inert without `entityUpdateParallel`; it is a crash fix, so it is not
+opt-in. Counters `ballisticsDeferred` / `ballisticsDrained` and `ragdollDeferred` / `ragdollDrained` on
+the batch status line, beside the emitter pair. `tests/pzopt/PhysicsDeferTest` pins both escapes in the
+game jar (a rework by the developers fails the build instead of silently un-deferring the fix), the jar's
+hitbox update still native and still fed from the shared static buffer, both overrides routed through the
+new helpers, the join draining both ahead of the Lua replay, each drain calling the real work, the
+off-task refusals, and the key's default. No performance number is claimed: work moved from the workers
+to the game thread, which is a cost, and the reason to pay it is that the alternative is a dead process.

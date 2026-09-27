@@ -3707,7 +3707,14 @@ public final class IsoZombie extends IsoGameCharacter implements IHumanVisual {
                      this.pathToCharacter(lowest);
                   }
                } else {
-                  if (this.isRagdoll()) {
+                  // pzopt: physicsDefer. The second Bullet escape from a batched entity's update, and the same
+                  // hazard as the hitbox one: vehicleCollision reaches setRagdollBodyDynamics /
+                  // resetRagdollBodyDynamics with a STATIC parameter array and runs BaseVehicle.testTouchingVehicle
+                  // against a vehicle the game thread may be updating that instant. It needs a ragdolling zombie in
+                  // contact with a car, which is why it had not crashed yet. On a batch task the call is queued with
+                  // this vehicle (the field is nulled a few lines down, so the reference has to travel) and the game
+                  // thread makes it at the join, by when the vehicles have finished updating.
+                  if (this.isRagdoll() && !pzopt.UpdateBatch.deferRagdollVehicle(this, this.vehicle4testCollision)) { // pzopt: physicsDefer
                      RagdollController ragdollController = this.getRagdollController();
                      ragdollController.vehicleCollision(this, this.vehicle4testCollision);
                   }
@@ -3853,6 +3860,19 @@ public final class IsoZombie extends IsoGameCharacter implements IHumanVisual {
          DebugLog.log(DebugType.Zombie, "removing stale zombie 5000 id=" + this.onlineId);
          DebugLog.log("Zombie: removing stale zombie 5000 id=" + this.onlineId);
          VirtualZombieManager.instance.removeZombieFromWorld(this);
+      }
+   }
+
+   /**
+    * pzopt: physicsDefer, the game thread's entry to one deferred ragdoll-versus-vehicle contact test at the join
+    * (the drain lives in pzopt.UpdateBatch, and the vehicle travels with the queue entry because updateInternal
+    * nulls vehicle4testCollision before the join). The controller is re-read here rather than carried along: the
+    * rest of this frame may have released the ragdoll, and then there is nothing to tell Bullet.
+    */
+   public void pzoptVehicleCollision(BaseVehicle vehicle) {
+      RagdollController ragdollController = this.getRagdollController();
+      if (ragdollController != null) {
+         ragdollController.vehicleCollision(this, vehicle);
       }
    }
 

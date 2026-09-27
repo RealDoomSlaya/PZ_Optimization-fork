@@ -241,6 +241,129 @@ public final class UpdateBatch {
       }
    }
 
+   // ── Deferred native physics (physicsDefer) ─────────────────────────────────────────────────────────────
+   //
+   // The emitter slot's shape again, for the two Bullet calls a batched entity's update can make. This one is
+   // not an optimization: with the batch on, shooting zombies killed the process in both live runs — SIGSEGV in
+   // libPZBullet64's btHashedOverlappingPairCache::removeOverlappingPair on a pzopt-frame worker, under
+   // IsoGameCharacter.updateInternal -> releaseBallisticsTarget -> BallisticsTarget.removeFromWorld. Bullet is
+   // not thread-safe, the game thread makes its own Bullet calls in the same window, and a native crash never
+   // reaches flightFailure, so the failure latch cannot turn the batch off after the fact: the calls have to be
+   // off the workers. Locking would not be enough either — BallisticsTarget.boneTransformData is a PUBLIC
+   // STATIC float[] that getBoneTransforms fills and hands straight to the native, and initialize() replaces it
+   // with a longer array when a taller skeleton arrives; the game thread's own BallisticsTarget.add() writes the
+   // same buffer. Deferring is what fixes that, because add() is game-thread-only.
+   //
+   //   ballistics: IsoGameCharacter.updateBallisticsTarget, the one caller of BallisticsTarget.update() and the
+   //     only route from an entity update to addBallisticsTarget / setBallisticsTargetAxis /
+   //     updateBallisticsTarget / updateBallisticsTargetSkeleton / removeBallisticsTarget (the last two through
+   //     the true return and releaseBallisticsTarget). CombatManager gives every character a gun is aimed at a
+   //     target, so with a rifle up this runs per aimed-at zombie per frame.
+   //   ragdolls: IsoZombie.updateInternal's RagdollController.vehicleCollision, which reaches
+   //     setRagdollBodyDynamics / resetRagdollBodyDynamics with the STATIC vehicleRagdollBodyDynamicsParams and
+   //     calls BaseVehicle.testTouchingVehicle on a vehicle the game thread may be updating that instant. Rare
+   //     (a ragdolling zombie in contact with a car), which is why it had not crashed yet; same hazard. It needs
+   //     the vehicle as well as the zombie, because updateInternal nulls vehicle4testCollision a few lines on —
+   //     hence a queue of pairs rather than of characters.
+   //
+   // Both queues live on one per-task slot under one key: same flight, same drain point, same reason. The drain
+   // is at joinPending like the emitters', before the Lua replay (a handler must not read a stale hitbox), and
+   // ragdolls before ballistics because that is their order inside one zombie's update (vehicleCollision sits
+   // above IsoZombie.updateInternal's super.update(), which is what reaches updateBallisticsTarget).
+   private record RagdollHit(zombie.characters.IsoZombie zombie, zombie.vehicles.BaseVehicle vehicle) {
+   }
+
+   private static final class PhysicsSlot {
+      final java.util.ArrayList<zombie.characters.IsoGameCharacter> ballistics = new java.util.ArrayList<>();
+      final java.util.ArrayList<RagdollHit> ragdolls = new java.util.ArrayList<>();
+   }
+
+   private static PhysicsSlot[] physicsSlots = new PhysicsSlot[4096];
+   private static final ThreadLocal<PhysicsSlot> PHYSICS_CAPTURE = new ThreadLocal<>();
+   private static long ballisticsDeferred, ballisticsDrained, ragdollDeferred, ragdollDrained;
+
+   /**
+    * A batch task reached {@code updateBallisticsTarget} with a live target: queue the character for the join's
+    * drain and return true. The caller checks {@code ballisticsTarget != null} BEFORE asking, so 12,000 zombies
+    * do not queue an entry a frame for a target almost none of them have. A plain reference read is atomic, so
+    * the worker sees either null or a valid target: a stale null only means the target — created this frame by
+    * the player's shot — updates one frame later, and a stale non-null is harmless because the game thread
+    * re-reads the field at the drain. Off a batch task (or with {@code physicsDefer} off at dispatch) the slot
+    * is unset and the caller runs the stock body in place.
+    */
+   public static boolean deferBallistics(zombie.characters.IsoGameCharacter character) {
+      PhysicsSlot slot = PHYSICS_CAPTURE.get();
+      if (slot == null) {
+         return false;
+      }
+
+      slot.ballistics.add(character);
+      ballisticsDeferred++;
+      return true;
+   }
+
+   /**
+    * A batch task reached {@code RagdollController.vehicleCollision}: queue the zombie with the vehicle it was
+    * handed (the field is nulled later in the same method, so the reference must travel with the entry) and
+    * return true. Off a batch task the slot is unset and the caller makes the call in place.
+    */
+   public static boolean deferRagdollVehicle(zombie.characters.IsoZombie zombie, zombie.vehicles.BaseVehicle vehicle) {
+      PhysicsSlot slot = PHYSICS_CAPTURE.get();
+      if (slot == null) {
+         return false;
+      }
+
+      slot.ragdolls.add(new RagdollHit(zombie, vehicle));
+      ragdollDeferred++;
+      return true;
+   }
+
+   /**
+    * Game thread, after the join: every task's queued hitbox updates through the override's drain entry point,
+    * in queue order, each under its own entity's multiplier (see {@link #drainEmitters}). The entry point calls
+    * the private stock method, which re-reads {@code ballisticsTarget} — so a target released between the
+    * worker's read and here is simply not updated, and the real work happens with the slot unset.
+    */
+   private static void drainBallistics(int n) {
+      float[] h = POM.get(); // joinPending set it to flightPom already; this is the same holder array
+      final float[] poms = flightPomArr;
+      for (int i = 0; i < n; i++) {
+         PhysicsSlot slot = physicsSlots[i];
+         if (slot == null || slot.ballistics.isEmpty()) {
+            continue;
+         }
+
+         h[0] = poms != null ? poms[i] : flightPom;
+         for (int j = 0; j < slot.ballistics.size(); j++) {
+            slot.ballistics.get(j).pzoptUpdateBallisticsTarget();
+            ballisticsDrained++;
+         }
+
+         slot.ballistics.clear();
+      }
+   }
+
+   /** Game thread, after the join: every task's queued ragdoll-versus-vehicle contact tests, in queue order. */
+   private static void drainRagdolls(int n) {
+      float[] h = POM.get();
+      final float[] poms = flightPomArr;
+      for (int i = 0; i < n; i++) {
+         PhysicsSlot slot = physicsSlots[i];
+         if (slot == null || slot.ragdolls.isEmpty()) {
+            continue;
+         }
+
+         h[0] = poms != null ? poms[i] : flightPom;
+         for (int j = 0; j < slot.ragdolls.size(); j++) {
+            RagdollHit hit = slot.ragdolls.get(j);
+            hit.zombie().pzoptVehicleCollision(hit.vehicle()); // the override re-reads the ragdoll controller
+            ragdollDrained++;
+         }
+
+         slot.ragdolls.clear();
+      }
+   }
+
    /**
     * A worker mid-batch reached a {@code triggerEvent} overload (the override calls this from behind its
     * {@link #onWorkerNow} guard): capture the dispatch for the game thread's replay, or count-and-drop when
@@ -652,6 +775,10 @@ public final class UpdateBatch {
       if (flightDefer && emitterCaptures.length < n) {
          emitterCaptures = java.util.Arrays.copyOf(emitterCaptures, Math.max(n, emitterCaptures.length * 2));
       }
+      final boolean flightPhysics = Config.PHYSICS_DEFER;
+      if (flightPhysics && physicsSlots.length < n) {
+         physicsSlots = java.util.Arrays.copyOf(physicsSlots, Math.max(n, physicsSlots.length * 2));
+      }
 
       // The bucket's frame mod, captured at dispatch: the game thread moves on to the next bucket — and
       // rewrites the global perObjectMultiplier — while these tasks still run, so every task reads THIS value
@@ -684,6 +811,15 @@ public final class UpdateBatch {
             }
             EMITTER_CAPTURE.set(emitterSlot); // deferEmitter queues here for this task
          }
+         PhysicsSlot physicsSlot = null;
+         if (flightPhysics) {
+            physicsSlot = physicsSlots[i];
+            if (physicsSlot == null) {
+               physicsSlot = new PhysicsSlot();
+               physicsSlots[i] = physicsSlot; // published to the game thread by the join
+            }
+            PHYSICS_CAPTURE.set(physicsSlot); // deferBallistics / deferRagdollVehicle queue here for this task
+         }
          try {
             entity.setCurrentSimulationLevel(level);
             entity.preupdate();
@@ -697,6 +833,9 @@ public final class UpdateBatch {
             }
             if (emitterSlot != null) {
                EMITTER_CAPTURE.set(null);
+            }
+            if (physicsSlot != null) {
+               PHYSICS_CAPTURE.set(null); // a pooled worker must not defer for the next batch's inline work
             }
          }
       }, fx -> flightFailure = fx);
@@ -767,6 +906,10 @@ public final class UpdateBatch {
       if (flightDefer && emitterCaptures.length < n) {
          emitterCaptures = java.util.Arrays.copyOf(emitterCaptures, Math.max(n, emitterCaptures.length * 2));
       }
+      final boolean flightPhysics = Config.PHYSICS_DEFER;
+      if (flightPhysics && physicsSlots.length < n) {
+         physicsSlots = java.util.Arrays.copyOf(physicsSlots, Math.max(n, physicsSlots.length * 2));
+      }
       final boolean flightReplay = luaReplay;
 
       flightFailure = null;
@@ -793,6 +936,15 @@ public final class UpdateBatch {
             }
             EMITTER_CAPTURE.set(emitterSlot); // deferEmitter queues here for this task
          }
+         PhysicsSlot physicsSlot = null;
+         if (flightPhysics) {
+            physicsSlot = physicsSlots[i];
+            if (physicsSlot == null) {
+               physicsSlot = new PhysicsSlot();
+               physicsSlots[i] = physicsSlot; // published to the game thread by the join
+            }
+            PHYSICS_CAPTURE.set(physicsSlot); // deferBallistics / deferRagdollVehicle queue here for this task
+         }
          try {
             entity.setCurrentSimulationLevel(LEVELS[levels[i]]);
             entity.preupdate();
@@ -806,6 +958,9 @@ public final class UpdateBatch {
             }
             if (emitterSlot != null) {
                EMITTER_CAPTURE.set(null);
+            }
+            if (physicsSlot != null) {
+               PHYSICS_CAPTURE.set(null); // a pooled worker must not defer for the next batch's inline work
             }
          }
       }, fx -> flightFailure = fx);
@@ -875,14 +1030,17 @@ public final class UpdateBatch {
       // failed batch, so a partially updated frame still lands its tile updates instead of leaking them.
       applyDeferredSquares();
 
-      // The window's deferred emitter ticks, then its captured Lua dispatches, both in queue order — stock's
-      // serial order — under the multiplier the batch dispatched with, so the ticks and the handlers see the
-      // same time scale as stock's inline run. Also after a failed batch: what deferred before the throw
-      // would have run in stock's semantics too.
+      // The window's deferred emitter ticks, then its deferred Bullet calls, then its captured Lua dispatches,
+      // all in queue order — stock's serial order — under the multiplier the batch dispatched with, so the
+      // ticks, the physics and the handlers see the same time scale as stock's inline run. Also after a failed
+      // batch: what deferred before the throw would have run in stock's semantics too.
       float[] h = POM.get();
       h[0] = flightPom; // NaN on the combined path: pom() falls through to the live global until a walker sets a task's own
       try {
          drainEmitters(n); // before the replay: a handler reading a zombie's sound state sees the ticked emitter
+         drainRagdolls(n); // physicsDefer, in one zombie's own order: vehicleCollision sits above its super.update()
+         drainBallistics(n); // ... which is what reaches updateBallisticsTarget; both before the replay, so no
+         // handler of a captured event can observe a hitbox that is still where the zombie stood last frame
          if (flightLuaReplay) {
             replayLuaEvents(n);
          }
@@ -987,6 +1145,8 @@ public final class UpdateBatch {
             + " work ms=" + (workNanos / 1_000_000L) + " wait ms=" + (waitNanos / 1_000_000L)
             + " luaCaptured=" + luaCaptured + " luaReplayed=" + luaReplayed
             + " emitterDeferred=" + emitterDeferred + " emitterDrained=" + emitterDrained
+            + " ballisticsDeferred=" + ballisticsDeferred + " ballisticsDrained=" + ballisticsDrained
+            + " ragdollDeferred=" + ragdollDeferred + " ragdollDrained=" + ragdollDrained
             + " luaSuppressed=" + luaSuppressed.get() + " pathfindRaceSkipped=" + pathfindRaceSkipped.get()
             + " movingSquareDeferred=" + movingSquareDeferred
             + " combinedFrames=" + combinedFrames + " inlineQueued=" + inlineQueued

@@ -16094,11 +16094,32 @@ public abstract class IsoGameCharacter
 
    private void updateBallisticsTarget() {
       if (this.ballisticsTarget != null) {
+         // pzopt: physicsDefer. Everything below this point is a Bullet call — BallisticsTarget.update() adds the
+         // hitbox to the physics world, pushes its axis, its position and its skeleton, and the true return takes
+         // it out again — and Bullet is not thread-safe, so on a batch task the work queues for the game thread's
+         // drain at the join instead of running on the worker. This is the crash: with the batch on, shooting
+         // zombies took the process down in both live runs (SIGSEGV in removeOverlappingPair on pzopt-frame-3),
+         // and a native crash never reaches the failure latch, so it cannot be caught and turned off after the
+         // fact. The null check above is deliberately ahead of this call: a horde queues nothing while no gun is
+         // aimed at it. Past here the worker must not touch the field or Bullet again.
+         if (pzopt.UpdateBatch.deferBallistics(this)) { // pzopt: physicsDefer
+            return; // pzopt: physicsDefer
+         }
+
          boolean releaseBallisticsTarget = this.ballisticsTarget.update();
          if (releaseBallisticsTarget) {
             this.releaseBallisticsTarget();
          }
       }
+   }
+
+   /**
+    * pzopt: physicsDefer, the game thread's entry to one deferred hitbox update at the join (the stock method is
+    * private, and the drain lives in pzopt.UpdateBatch). Nothing is passed along: the stock body re-reads
+    * {@code ballisticsTarget}, so a target the rest of this frame released is simply not updated.
+    */
+   public void pzoptUpdateBallisticsTarget() {
+      this.updateBallisticsTarget();
    }
 
    public void releaseBallisticsTarget() {
