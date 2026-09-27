@@ -25,9 +25,14 @@ import zombie.iso.IsoMovingObject;
  *
  * <p>The discriminating assertions: after {@code dispatchAsync} returns and every task has finished on the
  * workers, NOTHING has replayed yet (the synchronous shape would have replayed before returning), and the
- * captured events land exactly at {@code joinPending}. The bytecode half pins the wiring: the bucket
- * override's update() dispatches async and joins the previous flight, and the scheduler override's update()
- * holds the final join.
+ * captured events land exactly at {@code joinPending}.
+ *
+ * <p>The bytecode half pins where the flight is owned. Since the combined dispatch (spec 2026-09-27) that is
+ * the scheduler, not the bucket: the bucket's update() only queues — {@code queueInline} for the entities the
+ * inline phase will run, {@code run} for a non-combined frame's synchronous arm — and never dispatches, while
+ * the scheduler's update() latches the frame's shape once, sends the whole frame up in one flight, runs the
+ * inline entities under it and lands it at the tail. The per-bucket overlap those pins used to describe was
+ * measured empty (the game thread reached the join before the workers woke), which is why it is gone.
  */
 public class PipelineTest {
 
@@ -121,12 +126,17 @@ public class PipelineTest {
       Check.check(!UpdateBatch.hasFailed(), "nothing failed");
       gt.perObjectMultiplier = 1.0F;
 
-      // ── bytecode: the bucket dispatches async and joins the previous; the scheduler holds the final join ──
+      // ── bytecode: the bucket only queues on a combined frame; the scheduler owns the one dispatch ──
       MethodModel bucket = method(loose("zombie.MovingObjectUpdateSchedulerUpdateBucket"), "update", "(I)V");
-      Check.check(invokes(bucket, "dispatchAsync"), "the bucket's update() dispatches without joining");
-      Check.check(invokes(bucket, "joinPending"), "the bucket's update() lands the PREVIOUS bucket's flight");
+      Check.check(invokes(bucket, "queueInline"), "the bucket's update() defers its inline entities to the phase under the flight");
+      Check.check(invokes(bucket, "run"), "the bucket keeps the synchronous shape for a non-combined frame");
+      Check.check(!invokes(bucket, "dispatchAsync"),
+            "the bucket never dispatches: a combined frame goes up ONCE from the scheduler tail");
       Check.check(invokes(bucket, "stampInline"), "inline entities stamp their post-update position mid-flight");
       MethodModel sched = method(loose("zombie.MovingObjectUpdateScheduler"), "update", "()V");
+      Check.check(invokes(sched, "latchFrameFromConfig"), "the scheduler latches the frame's shape once, at entry");
+      Check.check(invokes(sched, "dispatchCombined"), "the scheduler sends the whole frame up in one flight");
+      Check.check(invokes(sched, "runInlinePhase"), "the scheduler runs the inline entities WHILE that flight is airborne");
       Check.check(invokes(sched, "joinPending"), "the scheduler's update() holds the final join after the last bucket");
 
       System.out.println("PipelineTest ok");

@@ -170,14 +170,25 @@ public final class MovingObjectUpdateScheduler {
 
    public void update() {
       pzopt.FrameTick.next(); // pzopt: the frame stamp of the simulation memos (separateFast, allPlayersAsleep)
+      boolean pzoptCombined = pzopt.UpdateBatch.latchFrameFromConfig(); // pzopt: entityUpdatePipeline -- the frame's shape, latched ONCE (a devPipelineAlternate flip then lands on a frame boundary instead of mixing one frame's buckets)
       if (this.pzoptSeparateBatch) {
          pzopt.SeparateBatch.run(); // pzopt: separateParallel, this frame's separations computed on the workers
       }
 
-      for (MovingObjectUpdateSchedulerUpdateBucket simulation : this.simulationLevels) {
-         simulation.update((int)this.frameCounter);
-      }
-      pzopt.UpdateBatch.joinPending(); // pzopt: entityUpdatePipeline -- the last bucket's batch is still airborne (each bucket joined only the PREVIOUS one); nothing past this line may see a half-updated entity, so land it here before postupdate and the render read anything
+      try { // pzopt: entityUpdatePipeline -- see the finally: nothing may leave this method with a flight airborne or with queued entities unrun
+         for (MovingObjectUpdateSchedulerUpdateBucket simulation : this.simulationLevels) {
+            simulation.update((int)this.frameCounter);
+         }
+      } finally { // pzopt: entityUpdatePipeline
+         try { // pzopt: entityUpdatePipeline
+            if (pzoptCombined) { // pzopt: entityUpdatePipeline (combined dispatch, spec 2026-09-27)
+               pzopt.UpdateBatch.dispatchCombined(); // pzopt: entityUpdatePipeline -- one workers-only flight for the whole frame
+               pzopt.UpdateBatch.runInlinePhase(); // pzopt: entityUpdatePipeline -- the player, vehicles and animals on the game thread WHILE that flight is airborne: this is the runway the per-bucket shape never had
+            } // pzopt: entityUpdatePipeline
+         } finally { // pzopt: entityUpdatePipeline
+            pzopt.UpdateBatch.joinPending(); // pzopt: entityUpdatePipeline -- the batch is still airborne and nothing past this line may see a half-updated entity, so land it here before postupdate and the render read anything (the inner finally: a throwing inline entity must not leave a flight up for updateZombieVocals, which reads every zombie)
+         } // pzopt: entityUpdatePipeline
+      } // pzopt: entityUpdatePipeline
    }
 
    public void postupdate() {
