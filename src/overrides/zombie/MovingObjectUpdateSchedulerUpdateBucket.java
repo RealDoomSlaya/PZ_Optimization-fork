@@ -48,7 +48,7 @@ public final class MovingObjectUpdateSchedulerUpdateBucket {
       // batch runs inside this method because perObjectMultiplier above is this bucket's frame mod and is 1 again
       // below: it is only constant while one bucket's entities are in flight, so a batch never spans two buckets.
       boolean pzoptBatch = pzopt.UpdateBatch.enabled();
-      if (pzoptBatch) {
+      if (pzoptBatch && !pzopt.UpdateBatch.combinedFrame()) { // pzopt: entityUpdatePipeline -- the combined frame accumulates across buckets; its clear happened at the frame latch
          pzopt.UpdateBatch.clear();
       }
 
@@ -71,9 +71,18 @@ public final class MovingObjectUpdateSchedulerUpdateBucket {
          // pzopt: entityUpdateParallel. A player, an animal or a grappled zombie is not handed over — it falls
          // through to the four calls below, in this loop, in stock's order, exactly as if the key were off.
          if (pzoptBatch && pzopt.UpdateBatch.batchable(isoMovingObject)) {
-            pzopt.UpdateBatch.add(isoMovingObject); // pzopt: entityUpdateParallel, run after the loop
+            if (pzopt.UpdateBatch.combinedFrame()) { // pzopt: entityUpdatePipeline (combined dispatch, spec 2026-09-27)
+               pzopt.UpdateBatch.add(isoMovingObject, this.simulationLevel.ordinal()); // pzopt: entityUpdatePipeline -- this bucket's multiplier is the live global right now; stamped per entity because the flight spans every bucket
+            } else { // pzopt: entityUpdatePipeline
+               pzopt.UpdateBatch.add(isoMovingObject); // pzopt: entityUpdateParallel, run after the loop
+            } // pzopt: entityUpdatePipeline
             continue;
          }
+
+         if (pzoptBatch && pzopt.UpdateBatch.combinedFrame()) { // pzopt: entityUpdatePipeline -- inline entities defer to the phase that runs under the flight (spec 3.4); stock's order is kept by the queue
+            pzopt.UpdateBatch.queueInline(isoMovingObject, this.simulationLevel.ordinal()); // pzopt: entityUpdatePipeline
+            continue; // pzopt: entityUpdatePipeline
+         } // pzopt: entityUpdatePipeline
 
          isoMovingObject.setCurrentSimulationLevel(this.simulationLevel);
          isoMovingObject.preupdate();
@@ -82,15 +91,10 @@ public final class MovingObjectUpdateSchedulerUpdateBucket {
          pzopt.UpdateBatch.stampInline(isoMovingObject); // pzopt: entityUpdatePipeline -- while the previous bucket's batch is airborne, freeze this inline entity's post-update position so its workers read a stable value (what they saw when inline entities all ran before the dispatch)
       }
 
-      if (pzoptBatch) {
-         // pzopt: entityUpdateParallel. Same four calls per entity, in the same order, on the workers; an entity
-         // that throws is reported once and turns the batching off, so the next frame walks the loop above.
-         if (pzopt.UpdateBatch.pipelineOn()) { // pzopt: entityUpdatePipeline (devPipelineAlternate flips this per window for the same-run A/B) -- the collection above overlapped the previous bucket's flight; land it, then send this bucket up without waiting
-            pzopt.UpdateBatch.joinPending(); // pzopt: entityUpdatePipeline
-            pzopt.UpdateBatch.dispatchAsync(this.simulationLevel); // pzopt: entityUpdatePipeline -- joined by the next bucket's update() or the scheduler override after the last one
-         } else { // pzopt: entityUpdatePipeline
-            pzopt.UpdateBatch.run(this.simulationLevel);
-         } // pzopt: entityUpdatePipeline
+      // pzopt: entityUpdateParallel. Same four calls per entity, in the same order, on the workers; an entity
+      // that throws is reported once and turns the batching off, so the next frame walks the loop above.
+      if (pzoptBatch && !pzopt.UpdateBatch.combinedFrame()) { // pzopt: entityUpdatePipeline -- a combined frame dispatches ONCE from the scheduler tail, not per bucket
+         pzopt.UpdateBatch.run(this.simulationLevel); // pzopt: entityUpdateParallel -- the synchronous shape, the rig's control arm
       }
 
       GameTime.getInstance().perObjectMultiplier = 1.0F;
