@@ -8,6 +8,7 @@ PzoptOptionClasses = {
     aimHoldMs = { "pzopt.InputLatch" },
     animalLosFast = { "IsoAnimal" },
     animalLosSnapshot = { "pzopt.AnimalLosSnapshot" },
+    animalsAfterJoin = { "pzopt.UpdateBatch" },
     animatorParallel = { "pzopt.AnimParallel" },
     animatorPipeline = { "pzopt.AnimParallel" },
     animBatchAsync = { "pzopt.AnimBatch" },
