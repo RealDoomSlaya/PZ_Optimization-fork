@@ -435,14 +435,17 @@ public final class ModCompat {
 
    /** mod id -> its folder, in the order the game searches: Zomboid/mods, the game's mods, the Workshop downloads. */
    static Map<String, File> modDirectories() {
+      return modDirectories(UserOptions.zomboidDir(), new File("").getAbsoluteFile()); // the game dir: the launcher's working directory
+   }
+
+   /** ModCompatTest: the same search from a given Zomboid folder and game dir. */
+   static Map<String, File> modDirectories(File zomboidDir, File game) {
       Map<String, File> m = new LinkedHashMap<>();
       List<File> roots = new ArrayList<>();
-      roots.add(new File(UserOptions.zomboidDir(), "mods"));
-      File game = new File("").getAbsoluteFile(); // the game dir: the launcher's working directory
+      roots.add(new File(zomboidDir, "mods"));
       roots.add(new File(game, "mods"));
-      File steamapps = game.getParentFile() != null && game.getParentFile().getParentFile() != null
-            ? game.getParentFile().getParentFile().getParentFile() : null; // .../steamapps/common/ProjectZomboid/projectzomboid
-      File[] items = steamapps != null ? new File(steamapps, "workshop/content/108600").listFiles() : null;
+      File content = workshopContent(game);
+      File[] items = content != null ? content.listFiles() : null;
       if (items != null) {
          for (File item : items) {
             roots.add(new File(item, "mods"));
@@ -463,6 +466,21 @@ public final class ModCompat {
          }
       }
       return m;
+   }
+
+   /**
+    * The Workshop downloads: Steam keeps them in the library that holds the game, so under the nearest steamapps folder
+    * at or above the game dir. The game dir sits at a different depth per platform: Linux
+    * .../steamapps/common/ProjectZomboid/projectzomboid, Windows ...\steamapps\common\ProjectZomboid, macOS
+    * .../steamapps/common/ProjectZomboid/Project Zomboid.app/Contents/Java. Null outside a Steam library.
+    */
+   static File workshopContent(File game) {
+      for (File f = game; f != null; f = f.getParentFile()) {
+         if (f.getName().equalsIgnoreCase("steamapps")) {
+            return new File(f, "workshop/content/108600");
+         }
+      }
+      return null;
    }
 
    /** The id= of every mod.info in a mod folder (its root, common/ and the version folders). */

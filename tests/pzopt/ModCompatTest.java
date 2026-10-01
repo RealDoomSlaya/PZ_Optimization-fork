@@ -1,6 +1,9 @@
 package pzopt;
 
+import java.io.File;
 import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -80,6 +83,35 @@ public class ModCompatTest {
       policy.put("modA", "off:luaSkipEmpty");
       ModCompat.applyForTest(all, edited, policy, rule, "auto");
       Check.check(rule.size() == 1 && "false".equals(rule.getProperty("luaSkipEmpty")), "an off: rule replaces the method's keys: " + rule);
+
+      // Workshop folder: in the game's Steam library, the game dir sits at a different depth per platform
+      Path tmp = Files.createTempDirectory("pzopt-modcompat");
+      try {
+         Path lib = tmp.resolve("SteamLibrary/steamapps");
+         Path game = lib.resolve("common/ProjectZomboid"); // Windows
+         Path mod = lib.resolve("workshop/content/108600/3809306528/mods/Viewpoint");
+         Files.createDirectories(game);
+         Files.createDirectories(mod.resolve("common"));
+         Files.writeString(mod.resolve("common/mod.info"), "name=Viewpoint\nid=Viewpoint\n");
+         File zomboid = tmp.resolve("Zomboid").toFile();
+         Map<String, File> dirs = ModCompat.modDirectories(zomboid, game.toFile());
+         Check.check(mod.toFile().equals(dirs.get("Viewpoint")), "a Workshop mod is found from the Windows game dir: " + dirs);
+         Path local = tmp.resolve("Zomboid/mods/Viewpoint");
+         Files.createDirectories(local);
+         Files.writeString(local.resolve("mod.info"), "id=Viewpoint\n");
+         dirs = ModCompat.modDirectories(zomboid, game.toFile());
+         Check.check(local.toFile().equals(dirs.get("Viewpoint")), "Zomboid/mods comes before the Workshop: " + dirs);
+
+         Check.check(lib.resolve("workshop/content/108600").toFile().equals(ModCompat.workshopContent(game.toFile())), "Windows layout");
+         Path linux = tmp.resolve("lib/steamapps");
+         Check.check(linux.resolve("workshop/content/108600").toFile()
+               .equals(ModCompat.workshopContent(linux.resolve("common/ProjectZomboid/projectzomboid").toFile())), "Linux layout");
+         Check.check(linux.resolve("workshop/content/108600").toFile()
+               .equals(ModCompat.workshopContent(linux.resolve("common/ProjectZomboid/Project Zomboid.app/Contents/Java").toFile())), "macOS layout");
+         Check.check(ModCompat.workshopContent(tmp.resolve("games/ProjectZomboid").toFile()) == null, "no steamapps above the game dir: no Workshop folder");
+      } finally {
+         Updater.deleteTree(tmp);
+      }
       System.out.println("ModCompatTest ok");
    }
 }
