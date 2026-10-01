@@ -39,6 +39,7 @@ public class LauncherJsonTest {
          invalidPending(game(base.resolve("invalid")));
          if (WINDOWS) {
             heldOnWindows(g, j1, dummy);
+            missingJsonOnWindows(game(base.resolve("missing")));
          } else {
             heldElsewhere(g, j1);
          }
@@ -157,6 +158,26 @@ public class LauncherJsonTest {
       Check.check(Files.readString(json, StandardCharsets.UTF_8).equals(restaged), "released: the helper moved the change in");
       Check.check(!Files.exists(pending), "released: the pending file is gone");
       Check.check(h2.waitFor(20, TimeUnit.SECONDS), "the retrying helper ends");
+   }
+
+   /**
+    * Windows: the JSON is gone and the pending file is left (ReplaceFile without a backup name can fail after removing
+    * the replaced file): the helper moves the pending file into its place.
+    */
+   static void missingJsonOnWindows(Path g) throws Exception {
+      Path json = g.resolve("ProjectZomboid64.json");
+      JSONObject staged = new JSONObject(STOCK);
+      staged.getJSONArray("vmArgs").put("-Dpzopt.test=restored");
+      String text = staged.toString(1) + "\n";
+      Files.writeString(pending(g), text, StandardCharsets.UTF_8);
+      Files.delete(json);
+      Process child = quiet(new ProcessBuilder("ping", "-n", "2", "127.0.0.1")).start();
+      Process h = LauncherJson.startExitHelper(g, child.pid());
+      Check.check(child.waitFor(20, TimeUnit.SECONDS), "the watched process ends");
+      Check.check(h.waitFor(30, TimeUnit.SECONDS), "the helper ends");
+      Check.check(Files.exists(json) && Files.readString(json, StandardCharsets.UTF_8).equals(text),
+            "the helper moved the pending file into the missing JSON's place");
+      Check.check(!Files.exists(pending(g)), "the pending file is gone");
    }
 
    /** 3. Linux / macOS: an open file does not block a rename over it. */

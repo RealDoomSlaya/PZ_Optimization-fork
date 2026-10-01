@@ -157,9 +157,12 @@ final class LauncherJson {
    }
 
    /**
-    * Waits for {@code pid} with no timeout (a session lasts hours), then moves the pending file over the JSON; a few
-    * tries, since a handle can outlive the process by a moment. Nothing to do once the pending file is gone (a later save
-    * of the same session landed).
+    * Waits for {@code pid} with no timeout (a session lasts hours), then replaces the JSON with the pending file in one
+    * call ([System.IO.File]::Replace, the Win32 ReplaceFile); a few tries, since a handle can outlive the process by a
+    * moment. The backup name is {@code [NullString]::Value}: PowerShell passes {@code $null} to a string
+    * parameter as "", which File.Replace refuses every time. Without a backup name ReplaceFile can fail after removing
+    * the JSON (ERROR_UNABLE_TO_MOVE_REPLACEMENT), so a missing JSON gets the pending file moved into its place. Nothing to
+    * do once the pending file is gone (a later save of the same session landed).
     */
    static String script(long pid, Path pending, Path json) {
       return String.join("\n",
@@ -167,7 +170,11 @@ final class LauncherJson {
             "Wait-Process -Id " + pid,
             "for ($i = 0; $i -lt 40; $i++) {",
             "  if (-not (Test-Path -LiteralPath " + quote(pending) + ")) { break }",
-            "  try { Move-Item -LiteralPath " + quote(pending) + " -Destination " + quote(json) + " -Force -ErrorAction Stop; break } catch { Start-Sleep -Milliseconds 250 }",
+            "  try {",
+            "    if (Test-Path -LiteralPath " + quote(json) + ") { [System.IO.File]::Replace(" + quote(pending) + ", " + quote(json)
+                  + ", [NullString]::Value) } else { [System.IO.File]::Move(" + quote(pending) + ", " + quote(json) + ") }",
+            "    break",
+            "  } catch { Start-Sleep -Milliseconds 250 }",
             "}");
    }
 
