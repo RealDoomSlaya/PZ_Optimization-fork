@@ -5,7 +5,6 @@ import java.lang.management.ManagementFactory;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -18,8 +17,8 @@ import org.json.JSONObject;
  * The edit replaces -XX:+UseZGC with -XX:+UseG1GC in the top-level and per-platform vmArgs, adds -XX:MaxGCPauseMillis
  * when {@code gcPauseMs} > 0, and the marker -Dpzopt.gc=g1 (also listing the pause flag it added, -Dpzopt.gc=g1,pause),
  * which is how this class, scripts/pzopt.sh and the installers recognise and undo it. It takes effect on the next
- * launch. Harness runs own the JSON (run.sh --gc) and are left alone. Backed up once and written atomically, as AotCache.
- * The macOS app bundle (Info.plist) is not changed.
+ * launch. Harness runs own the JSON (run.sh --gc) and are left alone. Read and written through pzopt.LauncherJson, as
+ * AotCache. The macOS app bundle (Info.plist) is not changed.
  *
  * gcHeap / gcHeapFixed / gcPreTouch (2026-10-05): the heap the next launch gets. The effective -Xmx (the last one) is
  * replaced by gcHeap: auto (default) = gcHeapAutoMb (4 GB), or gcHeapAutoModsMb (8 GB) when gcHeapAutoMods or more mods
@@ -65,7 +64,7 @@ public final class GcChoice {
          if (!Files.isRegularFile(json)) {
             return;
          }
-         JSONObject j = new JSONObject(Files.readString(json, StandardCharsets.UTF_8));
+         JSONObject j = LauncherJson.read(game);
          String before = j.toString();
          boolean want = Overrides.enabled() && wantG1();
          toStock(j); // from a clean stock form, so a changed gcPauseMs or mode is applied exactly
@@ -83,16 +82,17 @@ public final class GcChoice {
             heapToPzopt(j, heapMb, Config.GC_HEAP_FIXED, Config.GC_PRE_TOUCH);
          }
          boolean changed = !j.toString().equals(before);
+         String written = "";
+         if (changed) {
+            written = LauncherJson.save(game, j) ? " (launcher JSON updated)" : " (launcher JSON staged until the game exits)";
+         }
          Log.info("gc: running " + currentGc() + "; gcMode=" + Config.GC_MODE + " gcPauseMs=" + Config.GC_PAUSE_MS + " ("
                + Runtime.getRuntime().availableProcessors() + " cores) -> next launch " + (want ? "G1" : "the launcher's own collector")
                + "; heap now " + (Runtime.getRuntime().maxMemory() >> 20) + " MB max, gcHeap=" + Config.GC_HEAP + " (" + mods + " mods) -> "
                + (heapMb > 0 ? heapMb + " MB" : "the launcher's own")
                + (heapMb > 0 && heapMb != wantMb(Config.GC_HEAP, mods) ? " (clamped to half of " + (physicalMb() >> 10) + " GB RAM)" : "")
                + " gcHeapFixed=" + Config.GC_HEAP_FIXED + " gcPreTouch=" + Config.GC_PRE_TOUCH
-               + (changed ? " (launcher JSON updated)" : ""));
-         if (changed) {
-            save(game, j);
-         }
+               + written);
       } catch (Throwable e) {
          Log.warn("gc: " + e);
       }
@@ -199,7 +199,7 @@ public final class GcChoice {
       if (!Files.isRegularFile(json)) {
          return false;
       }
-      JSONObject j = new JSONObject(Files.readString(json, StandardCharsets.UTF_8));
+      JSONObject j = LauncherJson.read(game);
       String before = j.toString();
       toStock(j);
       jitToStock(j);
@@ -207,7 +207,7 @@ public final class GcChoice {
       if (j.toString().equals(before)) {
          return false;
       }
-      save(game, j);
+      LauncherJson.save(game, j);
       return true;
    }
 
@@ -390,21 +390,5 @@ public final class GcChoice {
             f.accept(a);
          }
       }
-   }
-
-   private static void save(Path game, JSONObject j) throws java.io.IOException {
-      Path json = game.resolve("ProjectZomboid64.json");
-      Path backup = game.resolve("ProjectZomboid64.json.pzopt-backup");
-      if (!Files.exists(backup)) {
-         Files.copy(json, backup);
-      }
-      Path tmp = game.resolve("ProjectZomboid64.json.pzopt-tmp");
-      Files.writeString(tmp, j.toString(1) + "\n", StandardCharsets.UTF_8);
-      JSONObject check = new JSONObject(Files.readString(tmp, StandardCharsets.UTF_8));
-      if (!check.has("mainClass") || check.getJSONArray("classpath").length() == 0 || check.getJSONArray("vmArgs").length() == 0) {
-         Files.deleteIfExists(tmp);
-         throw new java.io.IOException("launcher JSON check failed; left unchanged");
-      }
-      Files.move(tmp, json, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
    }
 }

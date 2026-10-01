@@ -34,9 +34,10 @@ import org.json.JSONObject;
  *   record               -> the cache is written at exit; JSON "use": -XX:AOTCache
  *   use                  -> nothing, unless the JVM's AOT log shows the cache was not used (game update, reinstall,
  *                           missing file) or the installed files changed: then back to record with a rebuilt jar.
- * The JSON is backed up once (ProjectZomboid64.json.pzopt-backup), written atomically and read back before it replaces
- * the original. Off (aotCache=false, the master switch, a build mismatch) or in a harness run, a JSON in the cache mode
- * is put back to the loose form. The installers (scripts/pzopt.sh, install.sh, install.ps1) and pzopt.Updater do the
+ * The JSON is read and written through pzopt.LauncherJson: backed up once (ProjectZomboid64.json.pzopt-backup), read back
+ * before it replaces the original, and on Windows, where the running game holds it, staged until the game exits. Off
+ * (aotCache=false, the master switch, a build mismatch) or in a harness run, a JSON in the cache mode is put back to the
+ * loose form. The installers (scripts/pzopt.sh, install.sh, install.ps1) and pzopt.Updater do the
  * same before they touch the loose files, so a stale jar can never shadow a newer install.
  */
 public final class AotCache {
@@ -228,8 +229,7 @@ public final class AotCache {
 
    /** Set the launcher to the cache form with the given AOT option (record or use). */
    static void writeLauncher(Path game, String aotOption) throws IOException {
-      Path json = game.resolve("ProjectZomboid64.json");
-      JSONObject j = new JSONObject(Files.readString(json, StandardCharsets.UTF_8));
+      JSONObject j = LauncherJson.read(game);
       stripAot(j);
       JSONArray cp = j.getJSONArray("classpath");
       JSONArray ncp = new JSONArray();
@@ -245,7 +245,7 @@ public final class AotCache {
          args.put(aotOption);
          args.put(OPT_LOG);
       });
-      save(game, j);
+      LauncherJson.save(game, j);
    }
 
    /** Put a cache-form launcher back to the loose form ("." first, no AOT options); false if it was loose already. */
@@ -254,7 +254,7 @@ public final class AotCache {
       if (!Files.isRegularFile(json)) {
          return false;
       }
-      JSONObject j = new JSONObject(Files.readString(json, StandardCharsets.UTF_8));
+      JSONObject j = LauncherJson.read(game);
       if (!isCacheForm(j)) {
          return false;
       }
@@ -269,7 +269,7 @@ public final class AotCache {
          }
       }
       j.put("classpath", ncp);
-      save(game, j);
+      LauncherJson.save(game, j);
       return true;
    }
 
@@ -325,23 +325,6 @@ public final class AotCache {
       if (top != null) {
          f.accept(top);
       }
-   }
-
-   private static void save(Path game, JSONObject j) throws IOException {
-      Path json = game.resolve("ProjectZomboid64.json");
-      Path backup = game.resolve("ProjectZomboid64.json.pzopt-backup");
-      if (!Files.exists(backup)) {
-         Files.copy(json, backup);
-      }
-      String text = j.toString(1);
-      Path tmp = game.resolve("ProjectZomboid64.json.pzopt-tmp");
-      Files.writeString(tmp, text + "\n", StandardCharsets.UTF_8);
-      JSONObject check = new JSONObject(Files.readString(tmp, StandardCharsets.UTF_8));
-      if (!check.has("mainClass") || check.getJSONArray("classpath").length() == 0 || check.getJSONArray("vmArgs").length() == 0) {
-         Files.deleteIfExists(tmp);
-         throw new IOException("launcher JSON check failed; left unchanged");
-      }
-      Files.move(tmp, json, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
    }
 
    private static Properties readState(Path game) {

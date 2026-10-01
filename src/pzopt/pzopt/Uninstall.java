@@ -119,6 +119,8 @@ public final class Uninstall {
       }
       files.add(root.resolve(Updater.MANIFEST));
       files.add(root.resolve(Updater.FILE_LIST));
+      // not ProjectZomboid64.json.pzopt-pending: on Windows it holds the restored launcher, which LauncherJson's helper
+      // moves over the JSON when the game exits
       files.add(root.resolve("ProjectZomboid64.json.pzopt-tmp"));
       Path aot = root.resolve("pzopt").resolve("aot");
       if (Files.isDirectory(aot)) {
