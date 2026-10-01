@@ -35,6 +35,8 @@ calls run on the batch's thread, results and exceptions returned). Bytecode audi
 
 Workshop folder on Windows and macOS (fixed after the matrix): the scan looked for the Workshop downloads three folders above the game dir, which fits only the Linux depot (`.../steamapps/common/ProjectZomboid/projectzomboid`); on Windows (`...\steamapps\common\ProjectZomboid`) that is the library root and on macOS (`.../Project Zomboid.app/Contents/Java`) the game's install folder, so a Windows boot logged `no Java mod patches a class we ship` while the Workshop mod Viewpoint loaded (32 patched methods of classes we ship, 9 of them edited, by the offline scan of its jar). It now walks up to the nearest `steamapps` folder, which holds the game's Workshop content on every platform; the matrix did not see the bug because `run.sh --mod` copies the mods into `Zomboid/mods`, which the scan reads first.
 
+Scan time with the Workshop found (Windows, 330 enabled mods, game running, warm): 2.65-2.72 s (3.6 s at a real boot), 88 % of it walking each enabled mod's whole tree for jars; now 159-166 ms, 358-373 ms when a jar is new or changed. A mod's jars are its `javaJarFile=` (resolved as ZombieBuddy does) plus a walk that enters only `java/` inside `media`, the mod folders are read on 8 threads, and each jar's hits are kept in `Zomboid/pzopt/mod-compat-cache.properties` (path, size and time; a new build or edited-method map empties it). All 472 mod folders give the same 6 jars as before.
+
 ## Open
 
 - ZombieBuddy 2.3.3 cannot load Java mods on 42.21 (stock too). Until it can, ZombieBuddy mods are covered by the scan and
