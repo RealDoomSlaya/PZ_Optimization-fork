@@ -27,6 +27,7 @@ public class UninstallTest {
 
    public static void main(String[] args) throws Exception {
       Path dir = Files.createTempDirectory("pzopt-uninstall-test");
+      LauncherJson.helperLog = dir.resolve("launcher-helper.log");
       try {
          plan(dir);
          launcher(dir);
@@ -169,9 +170,10 @@ public class UninstallTest {
       Files.write(dirs, p.dirs().stream().map(Path::toString).toList(), StandardCharsets.UTF_8);
       Process game = new ProcessBuilder("ping", "-n", "2", "127.0.0.1").redirectOutput(ProcessBuilder.Redirect.DISCARD).start();
       Files.writeString(files.resolveSibling(Uninstall.HELPER_PS1), Uninstall.windowsScript(game.pid(), files, dirs, log, g), StandardCharsets.UTF_8);
-      Process h = new ProcessBuilder(Uninstall.helper(true, game.pid(), files, dirs, log, g)).redirectOutput(ProcessBuilder.Redirect.DISCARD)
+      // the command starts a short-lived outer PowerShell; the helper itself runs detached and names its pid in the log
+      Process outer = new ProcessBuilder(Uninstall.helper(true, game.pid(), files, dirs, log, g)).redirectOutput(ProcessBuilder.Redirect.DISCARD)
             .redirectError(ProcessBuilder.Redirect.DISCARD).start();
-      return game.waitFor(20, TimeUnit.SECONDS) && h.waitFor(timeoutS, TimeUnit.SECONDS);
+      return game.waitFor(20, TimeUnit.SECONDS) && outer.waitFor(20, TimeUnit.SECONDS) && LauncherJsonTest.innerEnds("uninstall", game.pid(), timeoutS);
    }
 
    static String log(Path base, String name) throws Exception {
@@ -191,6 +193,9 @@ public class UninstallTest {
             "windows helper removed the files, pzopt\\aot included");
       String l = log(base, "win-applied");
       check(l.contains("uninstall finished; 0 files could not be removed") && !l.contains("kept"), "windows helper log: " + l);
+      String h = LauncherJsonTest.helperLog();
+      check(h.contains("uninstall: ProjectZomboid64.json.pzopt-pending applied") && h.matches("(?s).*uninstall: pid \\d+ ended.*"),
+            "windows helper: launcher-helper.log has the game's end and the outcome: " + h);
    }
 
    /** Windows: the JSON stays held, so the restored launcher cannot go in: pzopt\aot (which the live JSON still uses) stays. */
@@ -210,6 +215,9 @@ public class UninstallTest {
             "held: the other files are removed");
       String l = log(base, "win-held");
       check(l.contains("pzopt-pending") && l.contains("kept"), "held: the log says why pzopt\\aot stayed: " + l);
+      String h = LauncherJsonTest.helperLog();
+      check(h.contains("uninstall: ProjectZomboid64.json.pzopt-pending left after 40 tries: "),
+            "held: launcher-helper.log says how many tries and the last error: " + h);
    }
 
    /** Windows: paths with ' and the typographic quotes PowerShell also ends a string at. */

@@ -31,6 +31,7 @@ public class LauncherJsonTest {
 
    public static void main(String[] args) throws Exception {
       Path base = Files.createTempDirectory("pzopt launcher it's ‘q’ ");
+      LauncherJson.helperLog = base.resolve("launcher-helper.log");
       Process dummy = null;
       try {
          if (WINDOWS) {
@@ -43,6 +44,7 @@ public class LauncherJsonTest {
          invalidPending(game(base.resolve("invalid")));
          stalePending(game(base.resolve("stale-read")));
          if (WINDOWS) {
+            inheritedHandleOnWindows(game(base.resolve("inherited")));
             heldOnWindows(g, j1, dummy);
             missingJsonOnWindows(game(base.resolve("missing")));
             staleHelperOnWindows(game(base.resolve("stale-helper")));
@@ -54,10 +56,7 @@ public class LauncherJsonTest {
       } finally {
          if (dummy != null) {
             dummy.destroy();
-         }
-         Process armed = LauncherJson.armedHelper;
-         if (armed != null) {
-            armed.waitFor(20, TimeUnit.SECONDS);
+            innerEnds("exit", dummy.pid(), 20);
          }
          Updater.deleteTree(base);
       }
@@ -115,7 +114,7 @@ public class LauncherJsonTest {
          Check.check(!Files.exists(tmp), "no tmp file after a staged save");
          Check.check(LauncherJson.read(g).similar(j2), "read returns the staged change");
          Process armed = LauncherJson.armedHelper;
-         Check.check(armed != null && armed.isAlive(), "the staged save armed the exit helper");
+         Check.check(armed != null && innerAlive("exit", dummy.pid()), "the staged save armed the exit helper, which waits detached");
 
          JSONObject j3 = LauncherJson.read(g);
          j3.getJSONArray("vmArgs").put("-Dpzopt.test=three");
@@ -129,11 +128,12 @@ public class LauncherJsonTest {
          staged = Files.readString(pending, StandardCharsets.UTF_8);
       }
 
-      // the game ends: the helper moves the pending file over the JSON (a helper that did not wait moved it ~1.2 s
-      // after its start here, so the check at 3 s, with the watched process alive ~5 s, tells the two apart)
-      Process child = quiet(new ProcessBuilder("ping", "-n", "6", "127.0.0.1")).start();
-      Process h = LauncherJson.startExitHelper(g, child.pid());
-      Thread.sleep(3000);
+      // the game ends: the helper moves the pending file over the JSON (a helper that did not wait moved it ~2.5 s after
+      // its start here, outer and inner PowerShell included, so the check at 5 s, with the watched process alive ~7 s,
+      // tells the two apart)
+      Process child = quiet(new ProcessBuilder("ping", "-n", "8", "127.0.0.1")).start();
+      LauncherJson.startExitHelper(g, child.pid());
+      Thread.sleep(5000);
       boolean alive = child.isAlive();
       boolean stillPending = Files.exists(pending);
       Check.check(alive, "the watched process outlives the first check");
@@ -146,27 +146,31 @@ public class LauncherJsonTest {
       }
       Check.check(Files.readString(json, StandardCharsets.UTF_8).equals(staged), "the helper moved the staged JSON in: " + json(g));
       Check.check(!Files.exists(pending), "the pending file is gone");
-      Check.check(h.waitFor(20, TimeUnit.SECONDS), "the helper ends");
+      Check.check(innerEnds("exit", child.pid(), 20), "the helper ends");
+      String log = helperLog();
+      Check.check(log.contains("exit: pid " + child.pid() + " ended") && log.contains("exit: ProjectZomboid64.json.pzopt-pending applied"),
+            "the helper log has the end of the watched process and the outcome: " + log);
 
       // the helper the staged save armed: its process ends, nothing is pending, the JSON stays
-      Process armed = LauncherJson.armedHelper;
       dummy.destroy();
-      Check.check(armed.waitFor(20, TimeUnit.SECONDS), "the armed helper ends after its process");
+      Check.check(innerEnds("exit", dummy.pid(), 20), "the armed helper ends after its process");
       Check.check(Files.readString(json, StandardCharsets.UTF_8).equals(staged), "the armed helper left the applied JSON alone");
+      Check.check(helperLog().contains("exit: ProjectZomboid64.json.pzopt-pending none staged"), "the armed helper logged that nothing was staged");
 
       // a handle that outlives the watched process: the helper keeps trying and applies the change once it is released
       String restaged;
-      Process h2;
+      Process child2;
       try (FileInputStream hold = new FileInputStream(json.toFile())) {
          JSONObject j4 = LauncherJson.read(g);
          j4.getJSONArray("vmArgs").put("-Dpzopt.test=four");
          Check.check(!LauncherJson.save(g, j4), "held again: the change is staged");
          restaged = Files.readString(pending, StandardCharsets.UTF_8);
-         Process child2 = quiet(new ProcessBuilder("ping", "-n", "2", "127.0.0.1")).start();
-         h2 = LauncherJson.startExitHelper(g, child2.pid());
+         child2 = quiet(new ProcessBuilder("ping", "-n", "2", "127.0.0.1")).start();
+         LauncherJson.startExitHelper(g, child2.pid());
          Check.check(child2.waitFor(20, TimeUnit.SECONDS), "the second watched process ends");
-         Thread.sleep(4000);
-         Check.check(h2.isAlive() && Files.exists(pending) && Files.readString(json, StandardCharsets.UTF_8).equals(staged),
+         Check.check(innerPid("exit", child2.pid()) > 0, "the second helper started");
+         Thread.sleep(3000);
+         Check.check(innerAlive("exit", child2.pid()) && Files.exists(pending) && Files.readString(json, StandardCharsets.UTF_8).equals(staged),
                "while the JSON is still held the helper keeps trying and changes nothing");
       }
       deadline = System.currentTimeMillis() + 20_000;
@@ -176,7 +180,50 @@ public class LauncherJsonTest {
       }
       Check.check(Files.readString(json, StandardCharsets.UTF_8).equals(restaged), "released: the helper moved the change in");
       Check.check(!Files.exists(pending), "released: the pending file is gone");
-      Check.check(h2.waitFor(20, TimeUnit.SECONDS), "the retrying helper ends");
+      Check.check(innerEnds("exit", child2.pid(), 20), "the retrying helper ends");
+   }
+
+   /** The helper log as text (it may be half written: decoded leniently). */
+   static String helperLog() throws Exception {
+      Path log = LauncherJson.helperLog;
+      return Files.exists(log) ? new String(Files.readAllBytes(log), StandardCharsets.UTF_8) : "";
+   }
+
+   /** The detached helper's own pid from its start line ("<tag>: helper pid N waits for pid W"), within 20 s; else -1. */
+   static long innerPid(String tag, long watched) throws Exception {
+      java.util.regex.Pattern p = java.util.regex.Pattern.compile(java.util.regex.Pattern.quote(tag) + ": helper pid (\\d+) waits for pid " + watched + "(?!\\d)");
+      long deadline = System.currentTimeMillis() + 20_000;
+      while (System.currentTimeMillis() < deadline) {
+         java.util.regex.Matcher m = p.matcher(helperLog());
+         if (m.find()) {
+            return Long.parseLong(m.group(1));
+         }
+         Thread.sleep(50);
+      }
+      return -1;
+   }
+
+   static boolean innerAlive(String tag, long watched) throws Exception {
+      long pid = innerPid(tag, watched);
+      return pid > 0 && ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false);
+   }
+
+   /** True when the detached helper started and ended within {@code seconds}. */
+   static boolean innerEnds(String tag, long watched, long seconds) throws Exception {
+      long pid = innerPid(tag, watched);
+      if (pid < 0) {
+         return false;
+      }
+      java.util.Optional<ProcessHandle> h = ProcessHandle.of(pid);
+      if (h.isEmpty()) {
+         return true;
+      }
+      try {
+         h.get().onExit().get(seconds, TimeUnit.SECONDS);
+         return true;
+      } catch (java.util.concurrent.TimeoutException e) {
+         return false;
+      }
    }
 
    /**
@@ -191,12 +238,90 @@ public class LauncherJsonTest {
       Files.writeString(pending(g), text, StandardCharsets.UTF_8);
       Files.delete(json);
       Process child = quiet(new ProcessBuilder("ping", "-n", "2", "127.0.0.1")).start();
-      Process h = LauncherJson.startExitHelper(g, child.pid());
+      LauncherJson.startExitHelper(g, child.pid());
       Check.check(child.waitFor(20, TimeUnit.SECONDS), "the watched process ends");
-      Check.check(h.waitFor(30, TimeUnit.SECONDS), "the helper ends");
+      Check.check(innerEnds("exit", child.pid(), 30), "the helper ends");
       Check.check(Files.exists(json) && Files.readString(json, StandardCharsets.UTF_8).equals(text),
             "the helper moved the pending file into the missing JSON's place");
       Check.check(!Files.exists(pending(g)), "the pending file is gone");
+      Check.check(helperLog().contains("exit: ProjectZomboid64.json.pzopt-pending moved into place"), "the log says so: " + helperLog());
+   }
+
+   /**
+    * Windows: the native launcher reads the JSON through the C runtime, whose handles are inheritable, and Java starts a
+    * child process with handle inheritance; a helper started that way kept the launcher's handle on the JSON and blocked
+    * its own replace for all its tries (real session, 2026-10-01 12:29). Here a handle opened like the C runtime's
+    * (read, sharing read and write but not delete, inheritable) is open while the helper starts and closed when the
+    * "game" ends: the helper must have inherited nothing, so the staged launcher goes in.
+    */
+   static void inheritedHandleOnWindows(Path g) throws Exception {
+      Path json = g.resolve("ProjectZomboid64.json");
+      JSONObject staged = new JSONObject(STOCK);
+      staged.getJSONArray("vmArgs").put("-Dpzopt.test=inherited");
+      String text = staged.toString(1) + "\n";
+      Files.writeString(pending(g), text, StandardCharsets.UTF_8);
+      Files.setLastModifiedTime(pending(g), FileTime.fromMillis(Files.getLastModifiedTime(json).toMillis() + 1000));
+      Process child = quiet(new ProcessBuilder("ping", "-n", "3", "127.0.0.1")).start();
+      java.lang.foreign.MemorySegment handle = Win32.openInheritable(json);
+      try {
+         LauncherJson.startExitHelper(g, child.pid()); // created while the inheritable handle is open
+      } finally {
+         Win32.close(handle); // the "game" ends: its own handle goes
+      }
+      Check.check(child.waitFor(20, TimeUnit.SECONDS), "inherited: the watched process ends");
+      long deadline = System.currentTimeMillis() + 30_000;
+      while (System.currentTimeMillis() < deadline
+            && (Files.exists(pending(g)) || !Files.readString(json, StandardCharsets.UTF_8).equals(text))) {
+         Thread.sleep(100);
+      }
+      Check.check(Files.readString(json, StandardCharsets.UTF_8).equals(text) && !Files.exists(pending(g)),
+            "inherited: a helper started while an inheritable handle on the JSON was open applied the staged launcher: " + json(g));
+      Check.check(innerEnds("exit", child.pid(), 20) && helperLog().contains("exit: pid " + child.pid() + " ended"),
+            "inherited: the helper logged its start and the watched process's end: " + helperLog());
+   }
+
+   /** kernel32 through java.lang.foreign: a handle on a file opened the way the C runtime's fopen opens one. */
+   static final class Win32 {
+      private static final java.lang.foreign.Linker LINKER = java.lang.foreign.Linker.nativeLinker();
+      private static final java.lang.foreign.SymbolLookup KERNEL32 = java.lang.foreign.SymbolLookup.libraryLookup("kernel32",
+            java.lang.foreign.Arena.global());
+      private static final java.lang.invoke.MethodHandle CREATE_FILE = LINKER.downcallHandle(KERNEL32.find("CreateFileW").orElseThrow(),
+            java.lang.foreign.FunctionDescriptor.of(java.lang.foreign.ValueLayout.ADDRESS, java.lang.foreign.ValueLayout.ADDRESS,
+                  java.lang.foreign.ValueLayout.JAVA_INT, java.lang.foreign.ValueLayout.JAVA_INT, java.lang.foreign.ValueLayout.ADDRESS,
+                  java.lang.foreign.ValueLayout.JAVA_INT, java.lang.foreign.ValueLayout.JAVA_INT, java.lang.foreign.ValueLayout.ADDRESS));
+      private static final java.lang.invoke.MethodHandle SET_INFORMATION = LINKER.downcallHandle(KERNEL32.find("SetHandleInformation").orElseThrow(),
+            java.lang.foreign.FunctionDescriptor.of(java.lang.foreign.ValueLayout.JAVA_INT, java.lang.foreign.ValueLayout.ADDRESS,
+                  java.lang.foreign.ValueLayout.JAVA_INT, java.lang.foreign.ValueLayout.JAVA_INT));
+      private static final java.lang.invoke.MethodHandle CLOSE = LINKER.downcallHandle(KERNEL32.find("CloseHandle").orElseThrow(),
+            java.lang.foreign.FunctionDescriptor.of(java.lang.foreign.ValueLayout.JAVA_INT, java.lang.foreign.ValueLayout.ADDRESS));
+
+      /** GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE (no delete sharing), OPEN_EXISTING, then HANDLE_FLAG_INHERIT. */
+      static java.lang.foreign.MemorySegment openInheritable(Path f) throws Exception {
+         try (java.lang.foreign.Arena a = java.lang.foreign.Arena.ofConfined()) {
+            java.lang.foreign.MemorySegment name = a.allocateFrom(f.toAbsolutePath().toString(), StandardCharsets.UTF_16LE);
+            java.lang.foreign.MemorySegment h = (java.lang.foreign.MemorySegment) CREATE_FILE.invokeExact(name, 0x80000000, 3,
+                  java.lang.foreign.MemorySegment.NULL, 3, 0x80, java.lang.foreign.MemorySegment.NULL);
+            if (h.address() == -1L) {
+               throw new java.io.IOException("CreateFileW failed: " + f);
+            }
+            if ((int) SET_INFORMATION.invokeExact(h, 1, 1) == 0) {
+               throw new java.io.IOException("SetHandleInformation failed: " + f);
+            }
+            return h;
+         } catch (Exception e) {
+            throw e;
+         } catch (Throwable t) {
+            throw new RuntimeException(t);
+         }
+      }
+
+      static void close(java.lang.foreign.MemorySegment h) {
+         try {
+            int ok = (int) CLOSE.invokeExact(h);
+         } catch (Throwable t) {
+            throw new RuntimeException(t);
+         }
+      }
    }
 
    /** read(): a pending file older than the live JSON was overtaken (an installer, Steam): dropped, the live JSON read. */
@@ -223,10 +348,12 @@ public class LauncherJsonTest {
       Files.setLastModifiedTime(json, FileTime.fromMillis(Files.getLastModifiedTime(pending(g)).toMillis() + 10_000));
       String live = Files.readString(json, StandardCharsets.UTF_8);
       Process child = quiet(new ProcessBuilder("ping", "-n", "2", "127.0.0.1")).start();
-      Process h = LauncherJson.startExitHelper(g, child.pid());
-      Check.check(child.waitFor(20, TimeUnit.SECONDS) && h.waitFor(30, TimeUnit.SECONDS), "the watched process and the helper end");
+      LauncherJson.startExitHelper(g, child.pid());
+      Check.check(child.waitFor(20, TimeUnit.SECONDS) && innerEnds("exit", child.pid(), 30), "the watched process and the helper end");
       Check.check(Files.readString(json, StandardCharsets.UTF_8).equals(live), "the helper left the newer JSON alone");
       Check.check(!Files.exists(pending(g)), "the helper deleted the overtaken pending file");
+      Check.check(helperLog().contains("exit: ProjectZomboid64.json.pzopt-pending older than ProjectZomboid64.json: deleted"),
+            "the log says so: " + helperLog());
    }
 
    /**

@@ -91,8 +91,10 @@ public class RestartTest {
       for (String e : System.getProperty("java.class.path").split(java.util.regex.Pattern.quote(java.io.File.pathSeparator))) {
          cp.append(cp.length() > 0 ? java.io.File.pathSeparator : "").append(Path.of(e).toAbsolutePath());
       }
-      ProcessBuilder pb = new ProcessBuilder(Files.isRegularFile(javaw) ? javaw.toString() : javaExe.toString(), "-cp", cp.toString(),
-            "pzopt.RestartTest", "child", marker.toString(), "an arg with spaces", "it's quoted").directory(tmp.toFile()).inheritIO();
+      // the options file (and so the helpers' launcher-helper.log beside it) in tmp, not the user's Zomboid folder
+      Path options = tmp.resolve("options.ini");
+      ProcessBuilder pb = new ProcessBuilder(Files.isRegularFile(javaw) ? javaw.toString() : javaExe.toString(), "-Dpzopt.userOptionsFile=" + options,
+            "-cp", cp.toString(), "pzopt.RestartTest", "child", marker.toString(), "an arg with spaces", "it's quoted").directory(tmp.toFile()).inheritIO();
       pb.environment().remove(Restart.ENV_FROM);
       pb.environment().remove(Restart.ENV_AT);
       Process first = pb.start();
@@ -125,6 +127,18 @@ public class RestartTest {
       }
       if (!lines.get(8).equals(STAGED) || !lines.get(9).equals("no pending")) {
          System.err.println("FAIL: the new process started with launcher " + lines.get(8) + " / " + lines.get(9) + ", want the staged one applied");
+         failures++;
+      }
+      // the detached helper's notes (its last line follows the start of the new process)
+      Path helperLog = tmp.resolve("launcher-helper.log");
+      String log = "";
+      for (int i = 0; i < 100 && !log.contains("restart: started"); i++) {
+         log = Files.exists(helperLog) ? new String(Files.readAllBytes(helperLog), StandardCharsets.UTF_8) : "";
+         Thread.sleep(50);
+      }
+      if (!log.matches("(?s).*restart: helper pid \\d+ waits for pid " + first.pid() + "\\b.*") || !log.contains("restart: pid " + first.pid() + " ended")
+            || !log.contains("restart: ProjectZomboid64.json.pzopt-pending applied") || !log.contains("restart: started")) {
+         System.err.println("FAIL: launcher-helper.log: " + log);
          failures++;
       }
       Updater.deleteTree(tmp);

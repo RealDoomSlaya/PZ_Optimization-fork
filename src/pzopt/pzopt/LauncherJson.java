@@ -8,6 +8,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.Base64;
+import java.util.List;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -30,6 +31,14 @@ import org.json.JSONObject;
  * pzopt.Restart's (before it starts the game again, so the new launch reads the staged form). Whichever runs first
  * applies it; the others find it gone. A pending file older than the live JSON was overtaken (an installer or Steam
  * rewrote the launcher after the staging): readers and helpers drop it instead of putting it back.
+ *
+ * The helpers must inherit no handles: the native launcher reads the JSON through the C runtime, whose handles are
+ * inheritable, and Java starts a process with handle inheritance, so a helper started directly kept the launcher's
+ * handle on the JSON open and blocked its own replace (real session, 2026-10-01: the staged launcher was never applied).
+ * Java therefore starts a short-lived PowerShell whose only work is Start-Process of the real helper; Start-Process
+ * without -NoNewWindow or a redirect goes through ShellExecuteEx, which inherits no handles ({@link #startDetached}).
+ * Each helper notes when it started, when the game ended and what became of the pending file in
+ * Zomboid/pzopt/launcher-helper.log ({@link #helperLog}, kept under 64 KB).
  */
 final class LauncherJson {
    static final String NAME = "ProjectZomboid64.json";
@@ -37,13 +46,17 @@ final class LauncherJson {
    static final String TMP = NAME + ".pzopt-tmp";
    static final String PENDING = NAME + ".pzopt-pending";
    private static final boolean WINDOWS = File.separatorChar == '\\';
+   private static final int LOG_CAP = 64 * 1024;
+   private static final int LOG_KEEP = 32 * 1024;
 
    /** The process the exit helper waits for: this one, which holds the JSON; a test points it at another. */
    static long helperPid = ProcessHandle.current().pid();
-   /** The helper {@link #arm} started, for the test. */
+   /** The outer process of the helper {@link #arm} started, for the test. */
    static volatile Process armedHelper;
-   /** The exit helper's interpreter; a test points it at a missing one. */
+   /** The interpreter Java starts (the short-lived outer PowerShell); a test points it at a missing one. */
    static String powershell = "powershell.exe";
+   /** The helpers' log, beside options.ini (pzopt.UserOptions' folder); a test points it at a temporary file. */
+   static Path helperLog = UserOptions.file().toPath().toAbsolutePath().resolveSibling("launcher-helper.log");
    private static boolean armed;
 
    private LauncherJson() {
@@ -165,55 +178,113 @@ final class LauncherJson {
          Process p = startExitHelper(game, helperPid);
          armed = true;
          armedHelper = p;
-         Log.info("launcher JSON: helper (pid " + p.pid() + ") waits for pid " + helperPid + " to end, then applies " + PENDING);
+         Log.info("launcher JSON: exit helper started (detached, through pid " + p.pid() + "): it waits for pid " + helperPid
+               + " to end, then applies " + PENDING + "; log " + helperLog);
       } catch (Exception e) {
          Log.warn("launcher JSON: could not start the exit helper (" + e + "); " + PENDING + " stays staged, the next save tries again");
       }
    }
 
-   /** The helper as in pzopt.Restart / pzopt.Uninstall: a hidden PowerShell, no input, output discarded. */
+   /** Starts the exit helper detached ({@link #startDetached}); returns the short-lived outer process. */
    static Process startExitHelper(Path game, long pid) throws IOException {
       Path dir = game.toAbsolutePath();
-      String encoded = Base64.getEncoder().encodeToString(script(pid, dir).getBytes(StandardCharsets.UTF_16LE));
-      ProcessBuilder pb = new ProcessBuilder(powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
-            "-EncodedCommand", encoded).directory(dir.toFile());
+      ProcessBuilder pb = new ProcessBuilder(powershellCommand(detachedOuter(script(pid, dir)))).directory(dir.toFile());
       pb.redirectInput(ProcessBuilder.Redirect.from(new File("NUL")));
       pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
       pb.redirectError(ProcessBuilder.Redirect.DISCARD);
+      Files.createDirectories(helperLog.getParent());
       return pb.start();
    }
 
-   /** The exit helper: waits for {@code pid} with no timeout (a session lasts hours), then the shared apply step. */
+   /** The exit helper (inner): waits for {@code pid} with no timeout (a session lasts hours), then the shared apply step. */
    static String script(long pid, Path game) {
-      return "$ErrorActionPreference = 'SilentlyContinue'\nWait-Process -Id " + pid + "\n" + applyPendingScript(game);
+      return String.join("\n",
+            helperPrologue("exit", pid),
+            "Wait-Process -Id " + pid,
+            "PzoptLog 'exit: pid " + pid + " ended'",
+            applyPendingScript(game, "exit"));
    }
 
    /**
-    * The PowerShell that applies the staged launcher of {@code game}, for a helper that has waited for the game to end;
-    * it leaves {@code $pzoptPendingLeft} true when the pending file is still there afterwards. One call replaces the JSON
-    * ([System.IO.File]::Replace, the Win32 ReplaceFile); a few tries, since a handle can outlive the process by a moment.
-    * The backup name is {@code [NullString]::Value}: PowerShell passes {@code $null} to a string parameter as "", which
-    * File.Replace refuses every time. Without a backup name ReplaceFile can fail after removing the JSON
-    * (ERROR_UNABLE_TO_MOVE_REPLACEMENT), so a missing JSON gets the pending file moved into its place. A pending file
-    * older than the JSON was overtaken and is deleted instead. Nothing to do once the pending file is gone (a later save
-    * of the same session landed, or another helper applied it). .NET calls only: they throw into the catch whatever the
-    * caller's $ErrorActionPreference.
+    * How Java runs a helper's script: hidden Windows PowerShell, the script as -EncodedCommand (UTF-16LE base64), as in
+    * pzopt.Restart / pzopt.Uninstall before (the caller sets the input, output and directory).
     */
-   static String applyPendingScript(Path game) {
+   static List<String> powershellCommand(String script) {
+      return List.of(powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+            "-EncodedCommand", Base64.getEncoder().encodeToString(script.getBytes(StandardCharsets.UTF_16LE)));
+   }
+
+   /**
+    * The PowerShell statement that starts the script held by the PowerShell expression {@code innerExpr} in a hidden
+    * PowerShell that inherits no handles: Start-Process without -NoNewWindow, -Redirect* or -Credential goes through
+    * ShellExecuteEx (no handle inheritance), unlike Java's CreateProcess, which hands a child every inheritable handle of
+    * the game process, the native launcher's handle on the JSON included. Its environment is the caller's.
+    */
+   static String startDetached(String innerExpr) {
+      return "Start-Process -FilePath powershell.exe -WindowStyle Hidden -ArgumentList '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',"
+            + "'-EncodedCommand',([Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes(" + innerExpr + ")))";
+   }
+
+   /** The short-lived outer script for a fixed inner one: the inner as a literal, started detached, then exit. */
+   static String detachedOuter(String inner) {
+      return "$ErrorActionPreference = 'Stop'\n$pzoptInner = " + psQuote(inner) + "\n" + startDetached("$pzoptInner");
+   }
+
+   /**
+    * The start of every helper's inner script: errors silent, {@code PzoptLog} (one dated line to {@link #helperLog}, the
+    * file cut to its last 32 KB once past 64 KB, a few tries since two helpers may write at once), the start line.
+    */
+   static String helperPrologue(String tag, long pid) {
+      return String.join("\n",
+            "$ErrorActionPreference = 'SilentlyContinue'",
+            "$pzoptLog = " + psQuote(helperLog),
+            "function PzoptLog([string]$m) {",
+            "  for ($t = 0; $t -lt 5; $t++) {",
+            "    try {",
+            "      [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($pzoptLog))",
+            "      $f = New-Object System.IO.FileInfo $pzoptLog",
+            "      if ($f.Exists -and $f.Length -gt " + LOG_CAP + ") { $s = [System.IO.File]::ReadAllText($pzoptLog); $s = $s.Substring($s.IndexOf(\"`n\", "
+                  + "[Math]::Max(0, $s.Length - " + LOG_KEEP + ")) + 1); [System.IO.File]::WriteAllText($pzoptLog, $s) }",
+            "      [System.IO.File]::AppendAllText($pzoptLog, (Get-Date -Format s) + ' ' + $m + \"`r`n\")",
+            "      return",
+            "    } catch { Start-Sleep -Milliseconds 50 }",
+            "  }",
+            "}",
+            "PzoptLog \"" + tag + ": helper pid $PID waits for pid " + pid + "\"");
+   }
+
+   /**
+    * The PowerShell that applies the staged launcher of {@code game}, for a helper that has waited for the game to end
+    * (needs {@link #helperPrologue}); it leaves {@code $pzoptPendingLeft} true when the pending file is still there
+    * afterwards and logs the outcome. One call replaces the JSON ([System.IO.File]::Replace, the Win32 ReplaceFile); a
+    * few tries, since a handle can outlive the process by a moment. The backup name is {@code [NullString]::Value}:
+    * PowerShell passes {@code $null} to a string parameter as "", which File.Replace refuses every time. Without a backup
+    * name ReplaceFile can fail after removing the JSON (ERROR_UNABLE_TO_MOVE_REPLACEMENT), so a missing JSON gets the
+    * pending file moved into its place. A pending file older than the JSON was overtaken and is deleted instead. Nothing
+    * to do once the pending file is gone (a later save of the same session landed, or another helper applied it). .NET
+    * calls only: they throw into the catch whatever the caller's $ErrorActionPreference.
+    */
+   static String applyPendingScript(Path game, String tag) {
       Path dir = game.toAbsolutePath();
       return String.join("\n",
             "$pzoptPending = " + psQuote(dir.resolve(PENDING)),
             "$pzoptJson = " + psQuote(dir.resolve(NAME)),
+            "$pzoptDone = 'none staged'",
+            "$pzoptError = ''",
             "for ($pzoptTry = 0; $pzoptTry -lt 40; $pzoptTry++) {",
-            "  if (-not [System.IO.File]::Exists($pzoptPending)) { break }",
+            "  if (-not [System.IO.File]::Exists($pzoptPending)) { if ($pzoptTry -gt 0) { $pzoptDone = 'gone (another helper applied it)' }; break }",
             "  try {",
-            "    if (-not [System.IO.File]::Exists($pzoptJson)) { [System.IO.File]::Move($pzoptPending, $pzoptJson) }",
-            "    elseif ([System.IO.File]::GetLastWriteTimeUtc($pzoptJson) -gt [System.IO.File]::GetLastWriteTimeUtc($pzoptPending)) { [System.IO.File]::Delete($pzoptPending) }",
-            "    else { [System.IO.File]::Replace($pzoptPending, $pzoptJson, [NullString]::Value) }",
+            "    if (-not [System.IO.File]::Exists($pzoptJson)) { [System.IO.File]::Move($pzoptPending, $pzoptJson); $pzoptDone = 'moved into place (no "
+                  + NAME + ")' }",
+            "    elseif ([System.IO.File]::GetLastWriteTimeUtc($pzoptJson) -gt [System.IO.File]::GetLastWriteTimeUtc($pzoptPending)) { "
+                  + "[System.IO.File]::Delete($pzoptPending); $pzoptDone = 'older than " + NAME + ": deleted' }",
+            "    else { [System.IO.File]::Replace($pzoptPending, $pzoptJson, [NullString]::Value); $pzoptDone = 'applied' }",
             "    break",
-            "  } catch { Start-Sleep -Milliseconds 250 }",
+            "  } catch { $e = $_.Exception; if ($e.InnerException) { $e = $e.InnerException }; $pzoptError = $e.Message; Start-Sleep -Milliseconds 250 }",
             "}",
-            "$pzoptPendingLeft = [System.IO.File]::Exists($pzoptPending)");
+            "$pzoptPendingLeft = [System.IO.File]::Exists($pzoptPending)",
+            "if ($pzoptPendingLeft) { $pzoptDone = \"left after $pzoptTry tries: $pzoptError\" }",
+            "PzoptLog \"" + tag + ": " + PENDING + " $pzoptDone\"");
    }
 
    static String psQuote(Path p) {

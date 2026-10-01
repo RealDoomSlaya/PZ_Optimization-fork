@@ -4,9 +4,9 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -24,7 +24,8 @@ import java.util.concurrent.TimeUnit;
  * hidden PowerShell reads this process's command line from WMI, says so on its output (this method waits for that
  * line, so the game never quits before the helper knows what to start), waits for the process, applies the launcher JSON
  * this session staged (pzopt.LauncherJson: the running game holds the JSON, so its edits wait for the exit; the new
- * process must read them) and starts it again.
+ * process must read them) and starts it again. The waiting part runs detached (LauncherJson.startDetached), so it holds
+ * none of the game's handles: the outer PowerShell Java starts reads the command line, starts it and says "ready".
  */
 public final class Restart {
    private Restart() {
@@ -108,15 +109,17 @@ public final class Restart {
    }
 
    private static boolean windows(long pid, Path cwd) throws Exception {
-      String encoded = Base64.getEncoder().encodeToString(windowsScript(pid, cwd).getBytes(StandardCharsets.UTF_16LE));
-      ProcessBuilder pb = new ProcessBuilder("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-            "-WindowStyle", "Hidden", "-EncodedCommand", encoded).directory(cwd.toFile());
+      Files.createDirectories(LauncherJson.helperLog.getParent());
+      ProcessBuilder pb = new ProcessBuilder(LauncherJson.powershellCommand(windowsScript(pid, cwd))).directory(cwd.toFile());
       return startWindowsHelper(pb, pid);
    }
 
-   /** The Windows helper's PowerShell: the command line from WMI, "ready", wait, the staged launcher, start again. */
+   /**
+    * The Windows helper, outer part (started by Java, so it inherits the game's handles and must not stay): this process's
+    * command line from WMI, baked into the inner part as literals, the inner part started detached
+    * (LauncherJson.startDetached: no inherited handle on the launcher JSON), then "ready" on its output and exit.
+    */
    static String windowsScript(long pid, Path cwd) {
-      String dir = LauncherJson.psQuote(cwd);
       return String.join("\n",
             "$p = Get-CimInstance Win32_Process -Filter \"ProcessId=" + pid + "\"",
             "if (-not $p) { Write-Output 'none'; exit 1 }",
@@ -124,13 +127,29 @@ public final class Restart {
             "$cl = $p.CommandLine",
             "if ($cl.StartsWith('\"')) { $rest = $cl.Substring($cl.IndexOf('\"', 1) + 1) } else { $i = $cl.IndexOf(' '); if ($i -lt 0) { $rest = '' } else { $rest = $cl.Substring($i) } }",
             "$rest = $rest.Trim()",
+            // a single-quoted literal: PowerShell ends one at ' and at the typographic single quotes (LauncherJson.psQuote)
+            "function PzoptQ([string]$s) { \"'\" + ($s -replace \"['\\u2018\\u2019\\u201A\\u201B]\", '$0$0') + \"'\" }",
+            "$pzoptInner = '$exe = ' + (PzoptQ $exe) + \"`n\" + '$rest = ' + (PzoptQ $rest) + \"`n\" + " + LauncherJson.psQuote(windowsInner(pid, cwd)),
+            LauncherJson.startDetached("$pzoptInner"),
             "Write-Output 'ready'",
-            "[Console]::Out.Flush()",
-            "Wait-Process -Id " + pid + " -Timeout 120 -ErrorAction SilentlyContinue",
-            // the launcher this session staged goes in before the new process reads it (the game folder is the working
-            // directory, as for GcChoice); else the new session would hold the old JSON to its end
-            LauncherJson.applyPendingScript(cwd),
-            "if ($rest) { Start-Process -FilePath $exe -ArgumentList $rest -WorkingDirectory " + dir + " } else { Start-Process -FilePath $exe -WorkingDirectory " + dir + " }");
+            "[Console]::Out.Flush()");
+   }
+
+   /**
+    * The Windows helper, inner part ($exe and $rest are set above it): waits for the game, applies the launcher JSON this
+    * session staged before the new process reads it (the game folder is the working directory, as for GcChoice; else the
+    * new session would hold the old JSON to its end), starts the game again; notes each step in launcher-helper.log.
+    */
+   static String windowsInner(long pid, Path cwd) {
+      String dir = LauncherJson.psQuote(cwd);
+      return String.join("\n",
+            LauncherJson.helperPrologue("restart", pid),
+            "Wait-Process -Id " + pid + " -Timeout 120",
+            "if (Get-Process -Id " + pid + ") { PzoptLog 'restart: pid " + pid + " still running after 120 s, starting anyway' } else { PzoptLog 'restart: pid "
+                  + pid + " ended' }",
+            LauncherJson.applyPendingScript(cwd, "restart"),
+            "if ($rest) { Start-Process -FilePath $exe -ArgumentList $rest -WorkingDirectory " + dir + " } else { Start-Process -FilePath $exe -WorkingDirectory " + dir + " }",
+            "PzoptLog \"restart: started $exe\"");
    }
 
    private static boolean startWindowsHelper(ProcessBuilder pb, long pid) throws Exception {
@@ -163,8 +182,8 @@ public final class Restart {
          ok = false;
       }
       if (ok) {
-         Log.info("restart: helper (pid " + helper.pid() + ") has the command line, waits for pid " + pid + ", applies a staged "
-               + LauncherJson.NAME + " and starts the game again");
+         Log.info("restart: helper (pid " + helper.pid() + ") has the command line; its detached part waits for pid " + pid
+               + ", applies a staged " + LauncherJson.NAME + " and starts the game again; log " + LauncherJson.helperLog);
       } else {
          Log.warn("restart: the helper did not read the command line");
          helper.destroy();
