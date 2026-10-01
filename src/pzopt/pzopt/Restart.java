@@ -22,7 +22,9 @@ import java.util.concurrent.TimeUnit;
  * ({@link ProcessHandle.Info#command()}: /proc/self/exe or the Mach-O path, and the arguments the JVM reads from
  * /proc/self/cmdline or KERN_PROCARGS2). Windows keeps no argument list for another process that Java can read, so a
  * hidden PowerShell reads this process's command line from WMI, says so on its output (this method waits for that
- * line, so the game never quits before the helper knows what to start), waits for the process and starts it again.
+ * line, so the game never quits before the helper knows what to start), waits for the process, applies the launcher JSON
+ * this session staged (pzopt.LauncherJson: the running game holds the JSON, so its edits wait for the exit; the new
+ * process must read them) and starts it again.
  */
 public final class Restart {
    private Restart() {
@@ -106,8 +108,16 @@ public final class Restart {
    }
 
    private static boolean windows(long pid, Path cwd) throws Exception {
-      String dir = cwd.toString().replace("'", "''");
-      String script = String.join("\n",
+      String encoded = Base64.getEncoder().encodeToString(windowsScript(pid, cwd).getBytes(StandardCharsets.UTF_16LE));
+      ProcessBuilder pb = new ProcessBuilder("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            "-WindowStyle", "Hidden", "-EncodedCommand", encoded).directory(cwd.toFile());
+      return startWindowsHelper(pb, pid);
+   }
+
+   /** The Windows helper's PowerShell: the command line from WMI, "ready", wait, the staged launcher, start again. */
+   static String windowsScript(long pid, Path cwd) {
+      String dir = LauncherJson.psQuote(cwd);
+      return String.join("\n",
             "$p = Get-CimInstance Win32_Process -Filter \"ProcessId=" + pid + "\"",
             "if (-not $p) { Write-Output 'none'; exit 1 }",
             "$exe = $p.ExecutablePath",
@@ -117,10 +127,13 @@ public final class Restart {
             "Write-Output 'ready'",
             "[Console]::Out.Flush()",
             "Wait-Process -Id " + pid + " -Timeout 120 -ErrorAction SilentlyContinue",
-            "if ($rest) { Start-Process -FilePath $exe -ArgumentList $rest -WorkingDirectory '" + dir + "' } else { Start-Process -FilePath $exe -WorkingDirectory '" + dir + "' }");
-      String encoded = Base64.getEncoder().encodeToString(script.getBytes(StandardCharsets.UTF_16LE));
-      ProcessBuilder pb = new ProcessBuilder("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-            "-WindowStyle", "Hidden", "-EncodedCommand", encoded).directory(cwd.toFile());
+            // the launcher this session staged goes in before the new process reads it (the game folder is the working
+            // directory, as for GcChoice); else the new session would hold the old JSON to its end
+            LauncherJson.applyPendingScript(cwd),
+            "if ($rest) { Start-Process -FilePath $exe -ArgumentList $rest -WorkingDirectory " + dir + " } else { Start-Process -FilePath $exe -WorkingDirectory " + dir + " }");
+   }
+
+   private static boolean startWindowsHelper(ProcessBuilder pb, long pid) throws Exception {
       mark(pb);
       pb.redirectErrorStream(true);
       Process helper = pb.start();
@@ -150,7 +163,8 @@ public final class Restart {
          ok = false;
       }
       if (ok) {
-         Log.info("restart: helper (pid " + helper.pid() + ") has the command line, waits for pid " + pid);
+         Log.info("restart: helper (pid " + helper.pid() + ") has the command line, waits for pid " + pid + ", applies a staged "
+               + LauncherJson.NAME + " and starts the game again");
       } else {
          Log.warn("restart: the helper did not read the command line");
          helper.destroy();

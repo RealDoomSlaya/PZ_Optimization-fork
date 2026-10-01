@@ -32,7 +32,9 @@ import java.util.Set;
  * script file (Zomboid/pzopt/uninstall-helper.ps1) run with -File, not an -EncodedCommand: an encoded, hidden PowerShell
  * started by a game is what antivirus heuristics stop (2026-10-07, Workshop reports of a press that removed nothing).
  * Both helpers log "helper started" first, so uninstall.log tells a helper that never ran from one that failed. When
- * the files are still there at the next start (the list file left behind), pzopt.BootRepair removes them then.
+ * the files are still there at the next start (the list file left behind), pzopt.BootRepair removes them then. The
+ * launcher undo is staged while the running game holds its JSON, so the Windows helper applies it before deleting; if
+ * the JSON stays held it keeps pzopt\aot, from which the live JSON still starts the game.
  */
 public final class Uninstall {
    static final String LOG_NAME = "uninstall.log";
@@ -88,9 +90,9 @@ public final class Uninstall {
          long pid = ProcessHandle.current().pid();
          boolean windows = File.separatorChar == '\\';
          if (windows) {
-            Files.writeString(base.resolve(HELPER_PS1), windowsScript(pid, files, dirs, log), StandardCharsets.UTF_8);
+            Files.writeString(base.resolve(HELPER_PS1), windowsScript(pid, files, dirs, log, dir), StandardCharsets.UTF_8);
          }
-         ProcessBuilder pb = new ProcessBuilder(helper(windows, pid, files, dirs, log)).directory(base.toFile());
+         ProcessBuilder pb = new ProcessBuilder(helper(windows, pid, files, dirs, log, dir)).directory(base.toFile());
          pb.environment().remove("LD_PRELOAD"); // the Linux launcher's libPZXInitThreads64.so prints a line from every command the helper runs
          pb.redirectInput(ProcessBuilder.Redirect.from(new File(File.separatorChar == '\\' ? "NUL" : "/dev/null")));
          pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
@@ -119,8 +121,8 @@ public final class Uninstall {
       }
       files.add(root.resolve(Updater.MANIFEST));
       files.add(root.resolve(Updater.FILE_LIST));
-      // not ProjectZomboid64.json.pzopt-pending: on Windows it holds the restored launcher, which LauncherJson's helper
-      // moves over the JSON when the game exits
+      // not ProjectZomboid64.json.pzopt-pending: on Windows it holds the restored launcher, which the helper applies
+      // before it deletes anything (LauncherJson.applyPendingScript)
       files.add(root.resolve("ProjectZomboid64.json.pzopt-tmp"));
       Path aot = root.resolve("pzopt").resolve("aot");
       if (Files.isDirectory(aot)) {
@@ -168,8 +170,11 @@ public final class Uninstall {
       return out;
    }
 
-   /** The helper's command line: wait for {@code pid}, delete the listed files, remove the listed folders once empty, log. */
-   static List<String> helper(boolean windows, long pid, Path files, Path dirs, Path log) {
+   /**
+    * The helper's command line: wait for {@code pid}, delete the listed files, remove the listed folders once empty, log.
+    * On Windows it first applies the launcher the press staged in {@code game} (LauncherJson.applyPendingScript).
+    */
+   static List<String> helper(boolean windows, long pid, Path files, Path dirs, Path log, Path game) {
       if (!windows) {
          return List.of("/bin/sh", "-c", String.join("\n",
                "pid=$0; files=$1; dirs=$2; log=$3; n=0",
@@ -195,7 +200,8 @@ public final class Uninstall {
    }
 
    /** The Windows helper's script (written beside the lists as {@link #HELPER_PS1}; it deletes itself at the end). */
-   static String windowsScript(long pid, Path files, Path dirs, Path log) {
+   static String windowsScript(long pid, Path files, Path dirs, Path log, Path game) {
+      Path aot = game.toAbsolutePath().normalize().resolve("pzopt").resolve("aot");
       return String.join("\n",
             "$ErrorActionPreference = 'SilentlyContinue'",
             "$log = " + quote(log),
@@ -203,9 +209,16 @@ public final class Uninstall {
             "Wait-Process -Id " + pid + " -Timeout " + WAIT_S,
             "if (Get-Process -Id " + pid + ") { Add-Content -LiteralPath $log -Encoding UTF8 \"$(Get-Date -Format s) the game (pid " + pid
                   + ") was still running after " + WAIT_S + " s: nothing removed\"; exit 1 }",
+            // the restored launcher the press staged goes in first, so it is in place before pzopt\aot goes; if the JSON
+            // stays held, the live JSON still starts the game from pzopt\aot, which therefore stays
+            LauncherJson.applyPendingScript(game),
+            "$aot = " + quote(aot) + " + '\\'",
+            "if ($pzoptPendingLeft) { Add-Content -LiteralPath $log -Encoding UTF8 \"$(Get-Date -Format s) the restored launcher ("
+                  + LauncherJson.PENDING + ") could not replace " + LauncherJson.NAME + ": pzopt\\aot kept, the launcher still starts the game from it\" }",
             "$left = 0",
             "foreach ($f in Get-Content -LiteralPath " + quote(files) + " -Encoding UTF8) {",
             "  if (-not $f) { continue }",
+            "  if ($pzoptPendingLeft -and $f.StartsWith($aot, [System.StringComparison]::OrdinalIgnoreCase)) { continue }",
             // a handle can outlive the process by a moment (antivirus, the Steam overlay): a few tries
             "  for ($i = 0; $i -lt 20 -and (Test-Path -LiteralPath $f); $i++) { Remove-Item -LiteralPath $f -Force; if (Test-Path -LiteralPath $f) { Start-Sleep -Milliseconds 250 } }",
             "  if (Test-Path -LiteralPath $f) { Add-Content -LiteralPath $log -Encoding UTF8 \"left: $f\"; $left++ }",
@@ -220,6 +233,6 @@ public final class Uninstall {
    }
 
    private static String quote(Path p) {
-      return "'" + p.toString().replace("'", "''") + "'";
+      return LauncherJson.psQuote(p);
    }
 }

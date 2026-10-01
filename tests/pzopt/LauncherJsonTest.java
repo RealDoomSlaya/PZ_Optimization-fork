@@ -7,6 +7,7 @@ import java.nio.file.AccessDeniedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.FileTime;
 import java.util.concurrent.TimeUnit;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -17,7 +18,10 @@ import org.json.JSONObject;
  * it: the plain replace is refused (the bug), a save stages the change as .pzopt-pending and returns false, read()
  * returns the staged copy so the boot's second writer builds on the first one's change, and the exit helper moves it
  * over the JSON once the watched process has ended (retrying while a handle outlives it). Elsewhere the hold does not
- * block a rename. An invalid pending file is ignored, and a save that lands removes any pending file.
+ * block a rename. An invalid pending file is ignored, and a save that lands removes any pending file. A pending file
+ * older than the live JSON (something rewrote the launcher after the staging) is dropped by read() and by the helper.
+ * A helper that cannot start is not counted as armed: the next save starts one. A pending file a landed save cannot
+ * delete is logged, not thrown. The folders' names hold ' and the typographic quotes PowerShell also ends a string at.
  */
 public class LauncherJsonTest {
    private static final boolean WINDOWS = File.separatorChar == '\\';
@@ -26,7 +30,7 @@ public class LauncherJsonTest {
          + "\"windows\":{\"6.1\":{\"vmArgs\":[\"-XX:+UseG1GC\"]},\"10.0.17134\":{\"vmArgs\":[\"-XX:+UseZGC\"]}}}";
 
    public static void main(String[] args) throws Exception {
-      Path base = Files.createTempDirectory("pzopt-launcher-test");
+      Path base = Files.createTempDirectory("pzopt launcher it's ‘q’ ");
       Process dummy = null;
       try {
          if (WINDOWS) {
@@ -37,13 +41,16 @@ public class LauncherJsonTest {
          Path g = game(base.resolve("held"));
          JSONObject j1 = noHolder(g);
          invalidPending(game(base.resolve("invalid")));
+         stalePending(game(base.resolve("stale-read")));
          if (WINDOWS) {
             heldOnWindows(g, j1, dummy);
             missingJsonOnWindows(game(base.resolve("missing")));
+            staleHelperOnWindows(game(base.resolve("stale-helper")));
+            undeletablePendingOnWindows(game(base.resolve("undeletable")));
          } else {
             heldElsewhere(g, j1);
          }
-         saveRemovesPending(game(base.resolve("stale")));
+         saveRemovesPending(game(base.resolve("landed")));
       } finally {
          if (dummy != null) {
             dummy.destroy();
@@ -87,6 +94,18 @@ public class LauncherJsonTest {
          }
          Files.deleteIfExists(tmp);
          Check.check(denied, "the hold reproduces the bug: the plain replace is refused with AccessDeniedException");
+
+         // the helper cannot start: the change is staged, nothing counts as armed, a WARN says so; the next save starts it
+         String ps = LauncherJson.powershell;
+         LauncherJson.powershell = "pzopt-no-such-powershell.exe";
+         JSONObject j0 = new JSONObject(json(g).toString());
+         boolean[] landed = {true};
+         String log = logOf(() -> landed[0] = LauncherJson.save(g, j0));
+         LauncherJson.powershell = ps;
+         Check.check(!landed[0] && Files.exists(pending), "a held JSON with no helper: the change is still staged");
+         Check.check(LauncherJson.armedHelper == null, "a helper that did not start is not counted as armed");
+         Check.check(log.contains("WARN") && log.contains("exit helper"), "the failed start is logged as a warning: " + log);
+         Check.check(!LauncherJson.save(g, j0) && LauncherJson.armedHelper != null, "the next save starts the helper");
 
          JSONObject j2 = LauncherJson.read(g);
          j2.getJSONArray("vmArgs").put("-Dpzopt.test=two");
@@ -178,6 +197,77 @@ public class LauncherJsonTest {
       Check.check(Files.exists(json) && Files.readString(json, StandardCharsets.UTF_8).equals(text),
             "the helper moved the pending file into the missing JSON's place");
       Check.check(!Files.exists(pending(g)), "the pending file is gone");
+   }
+
+   /** read(): a pending file older than the live JSON was overtaken (an installer, Steam): dropped, the live JSON read. */
+   static void stalePending(Path g) throws Exception {
+      JSONObject staged = new JSONObject(STOCK);
+      staged.getJSONArray("vmArgs").put("-Dpzopt.test=overtaken");
+      Files.writeString(pending(g), staged.toString(1), StandardCharsets.UTF_8);
+      FileTime t = Files.getLastModifiedTime(pending(g));
+      Files.setLastModifiedTime(g.resolve("ProjectZomboid64.json"), FileTime.fromMillis(t.toMillis() + 10_000));
+      JSONObject[] got = new JSONObject[1];
+      String log = logOf(() -> got[0] = LauncherJson.read(g));
+      Check.check(got[0].similar(new JSONObject(STOCK)), "a pending file older than the JSON: read returns the live JSON: " + got[0]);
+      Check.check(!Files.exists(pending(g)), "the overtaken pending file is deleted");
+      Check.check(log.contains("pzopt-pending") && log.lines().count() == 1, "one log line says so: " + log);
+      Check.check(LauncherJson.armedHelper == null, "an overtaken pending file arms no helper");
+   }
+
+   /** Windows: the helper finds a pending file older than the JSON: it deletes it and leaves the JSON alone. */
+   static void staleHelperOnWindows(Path g) throws Exception {
+      Path json = g.resolve("ProjectZomboid64.json");
+      JSONObject staged = new JSONObject(STOCK);
+      staged.getJSONArray("vmArgs").put("-Dpzopt.test=overtaken");
+      Files.writeString(pending(g), staged.toString(1), StandardCharsets.UTF_8);
+      Files.setLastModifiedTime(json, FileTime.fromMillis(Files.getLastModifiedTime(pending(g)).toMillis() + 10_000));
+      String live = Files.readString(json, StandardCharsets.UTF_8);
+      Process child = quiet(new ProcessBuilder("ping", "-n", "2", "127.0.0.1")).start();
+      Process h = LauncherJson.startExitHelper(g, child.pid());
+      Check.check(child.waitFor(20, TimeUnit.SECONDS) && h.waitFor(30, TimeUnit.SECONDS), "the watched process and the helper end");
+      Check.check(Files.readString(json, StandardCharsets.UTF_8).equals(live), "the helper left the newer JSON alone");
+      Check.check(!Files.exists(pending(g)), "the helper deleted the overtaken pending file");
+   }
+
+   /**
+    * Windows: a save lands but the pending file cannot be deleted (held without delete sharing): logged, not thrown,
+    * and the leftover is overtaken by the JSON the save wrote, so the next read drops it.
+    */
+   static void undeletablePendingOnWindows(Path g) throws Exception {
+      JSONObject staged = new JSONObject(STOCK);
+      staged.getJSONArray("vmArgs").put("-Dpzopt.test=leftover");
+      Files.writeString(pending(g), staged.toString(1), StandardCharsets.UTF_8);
+      Files.setLastModifiedTime(pending(g), FileTime.fromMillis(System.currentTimeMillis() - 60_000));
+      JSONObject j = new JSONObject(STOCK);
+      j.getJSONArray("vmArgs").put("-Dpzopt.test=landed-anyway");
+      boolean[] landed = {false};
+      String log;
+      try (FileInputStream hold = new FileInputStream(pending(g).toFile())) {
+         log = logOf(() -> landed[0] = LauncherJson.save(g, j));
+      }
+      Check.check(landed[0] && json(g).similar(j), "the save landed although the pending file could not be deleted");
+      Check.check(log.contains("WARN") && log.contains("pzopt-pending"), "the leftover is logged: " + log);
+      Check.check(!Files.exists(tmp(g)), "no tmp file");
+      Check.check(LauncherJson.read(g).similar(j) && !Files.exists(pending(g)), "the next read drops the overtaken leftover");
+   }
+
+   /** Runs {@code b} with System.out captured (pzopt.Log prints there outside the game); echoes and returns it. */
+   static String logOf(Body b) throws Exception {
+      java.io.PrintStream old = System.out;
+      java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+      System.setOut(new java.io.PrintStream(buf, true, StandardCharsets.UTF_8));
+      try {
+         b.run();
+      } finally {
+         System.setOut(old);
+      }
+      String s = buf.toString(StandardCharsets.UTF_8);
+      System.out.print(s);
+      return s;
+   }
+
+   interface Body {
+      void run() throws Exception;
    }
 
    /** 3. Linux / macOS: an open file does not block a rename over it. */

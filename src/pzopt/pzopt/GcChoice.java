@@ -17,8 +17,8 @@ import org.json.JSONObject;
  * The edit replaces -XX:+UseZGC with -XX:+UseG1GC in every vmArgs array that holds it, at any depth (the real Windows
  * launcher keeps its collector in windows."10.0.17134".vmArgs), adds -XX:MaxGCPauseMillis to that array
  * when {@code gcPauseMs} > 0, and the marker -Dpzopt.gc=g1 (also listing the pause flag it added, -Dpzopt.gc=g1,pause),
- * which is how this class, scripts/pzopt.sh and the installers recognise and undo it (the scripts' undo reaches the
- * top-level and per-platform vmArgs only, not a per-OS version section). It takes effect on the next
+ * which is how this class, scripts/pzopt.sh and the installers recognise and undo it, in vmArgs arrays at any depth
+ * (tests/pzopt/InstallerLauncherTest runs the scripts' undo on the real Windows layout). It takes effect on the next
  * launch. Harness runs own the JSON (run.sh --gc) and are left alone. Read and written through pzopt.LauncherJson, as
  * AotCache. The macOS app bundle (Info.plist) is not changed.
  *
