@@ -26,7 +26,8 @@ public class RestartTest {
          if (failures > 0) {
             throw new AssertionError(failures + " check(s) failed");
          }
-         System.out.println("RestartTest ok (Windows: the staged launcher was in place when the new process started)");
+         System.out.println("RestartTest ok (Windows: the staged launcher was in place when the new process started; helper ready after "
+               + String.join(" / ", READY_MS) + " ms)");
          return;
       }
       Path tmp = Files.createTempDirectory("pzopt-restart-test");
@@ -93,19 +94,29 @@ public class RestartTest {
       }
       // the options file (and so the helpers' launcher-helper.log beside it) in tmp, not the user's Zomboid folder
       Path options = tmp.resolve("options.ini");
+      // the stand-in game's output (pzopt.Log prints to stdout outside the game) kept for the report
+      Path firstOut = tmp.resolve("first.out");
       ProcessBuilder pb = new ProcessBuilder(Files.isRegularFile(javaw) ? javaw.toString() : javaExe.toString(), "-Dpzopt.userOptionsFile=" + options,
-            "-cp", cp.toString(), "pzopt.RestartTest", "child", marker.toString(), "an arg with spaces", "it's quoted").directory(tmp.toFile()).inheritIO();
+            "-cp", cp.toString(), "pzopt.RestartTest", "child", marker.toString(), "an arg with spaces", "it's quoted").directory(tmp.toFile())
+            .redirectErrorStream(true).redirectOutput(firstOut.toFile());
       pb.environment().remove(Restart.ENV_FROM);
       pb.environment().remove(Restart.ENV_AT);
       Process first = pb.start();
-      if (first.waitFor() != 0) {
-         throw new AssertionError("first process failed in " + tmp);
+      int code = first.waitFor();
+      java.util.regex.Matcher ready = java.util.regex.Pattern.compile("ready after (\\d+) ms").matcher(tail(firstOut, 100));
+      if (ready.find()) {
+         READY_MS.add(ready.group(1));
       }
-      for (int i = 0; i < 400 && !Files.exists(marker); i++) {
+      if (code != 0) {
+         throw new AssertionError("first process failed in " + tmp + " with exit code " + code + " (3: Restart.relaunch() returned false)"
+               + "\n--- its output:\n" + tail(firstOut, 20) + "\n--- launcher-helper.log:\n" + tail(tmp.resolve("launcher-helper.log"), 20));
+      }
+      for (int i = 0; i < 800 && !Files.exists(marker); i++) {
          Thread.sleep(50);
       }
       if (!Files.exists(marker)) {
-         System.err.println("FAIL: no restarted process within 20 s in " + tmp);
+         System.err.println("FAIL: no restarted process within 40 s in " + tmp + "\n--- the first process's output:\n" + tail(firstOut, 20)
+               + "\n--- launcher-helper.log:\n" + tail(tmp.resolve("launcher-helper.log"), 20));
          return 1;
       }
       List<String> lines = Files.readAllLines(marker, StandardCharsets.UTF_8);
@@ -143,6 +154,18 @@ public class RestartTest {
       }
       Updater.deleteTree(tmp);
       return failures;
+   }
+
+   /** The ready times Restart logged ("ready after N ms"), one per Windows run. */
+   static final List<String> READY_MS = new java.util.ArrayList<>();
+
+   /** The last {@code n} lines of a file (decoded leniently), or "(none)". */
+   static String tail(Path f, int n) throws Exception {
+      if (!Files.exists(f)) {
+         return "(none)";
+      }
+      List<String> lines = List.of(new String(Files.readAllBytes(f), StandardCharsets.UTF_8).split("\r?\n"));
+      return String.join("\n", lines.subList(Math.max(0, lines.size() - n), lines.size()));
    }
 
    static void child(String[] args) throws Exception {

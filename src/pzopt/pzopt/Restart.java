@@ -121,6 +121,8 @@ public final class Restart {
     */
    static String windowsScript(long pid, Path cwd) {
       return String.join("\n",
+            // progress for the game's log if "ready" never comes (written past the pipeline, flushed at once)
+            "[Console]::Out.WriteLine('step wmi'); [Console]::Out.Flush()",
             "$p = Get-CimInstance Win32_Process -Filter \"ProcessId=" + pid + "\"",
             "if (-not $p) { Write-Output 'none'; exit 1 }",
             "$exe = $p.ExecutablePath",
@@ -130,6 +132,7 @@ public final class Restart {
             // a single-quoted literal: PowerShell ends one at ' and at the typographic single quotes (LauncherJson.psQuote)
             "function PzoptQ([string]$s) { \"'\" + ($s -replace \"['\\u2018\\u2019\\u201A\\u201B]\", '$0$0') + \"'\" }",
             "$pzoptInner = '$exe = ' + (PzoptQ $exe) + \"`n\" + '$rest = ' + (PzoptQ $rest) + \"`n\" + " + LauncherJson.psQuote(windowsInner(pid, cwd)),
+            "[Console]::Out.WriteLine('step start'); [Console]::Out.Flush()",
             LauncherJson.startDetached("$pzoptInner"),
             "Write-Output 'ready'",
             "[Console]::Out.Flush()");
@@ -152,42 +155,100 @@ public final class Restart {
             "PzoptLog \"restart: started $exe\"");
    }
 
+   /**
+    * How long the game waits for the helper's "ready": a cold PowerShell start, the WMI query and the detached start of
+    * the waiting part. Usually 1-3 s; an old disk or an antivirus scanning powershell.exe can take far longer, and the
+    * game must not quit before the helper is ready, so the headroom is generous.
+    */
+   static final int READY_TIMEOUT_S = 60;
+
    private static boolean startWindowsHelper(ProcessBuilder pb, long pid) throws Exception {
       mark(pb);
       pb.redirectErrorStream(true);
+      long t0 = System.nanoTime();
       Process helper = pb.start();
       helper.getOutputStream().close();
-      // wait until the helper has our command line; the game must not quit before
+      // wait until the helper has our command line and has started its waiting part; the game must not quit before
       BufferedReader out = new BufferedReader(new InputStreamReader(helper.getInputStream(), StandardCharsets.UTF_8));
-      CompletableFuture<Boolean> ready = CompletableFuture.supplyAsync(() -> {
+      String[] step = {"start of PowerShell"};
+      List<String> other = java.util.Collections.synchronizedList(new ArrayList<>());
+      CompletableFuture<String> ready = CompletableFuture.supplyAsync(() -> {
          try {
             String line;
             while ((line = out.readLine()) != null) {
-               if (line.strip().equals("ready")) {
-                  return true;
+               String s = line.strip();
+               if (s.equals("ready") || s.equals("none")) {
+                  return s;
+               }
+               if (s.startsWith("step ")) {
+                  step[0] = s.substring(5);
+               } else {
+                  String r = readable(s);
+                  if (!r.isEmpty()) {
+                     other.add(r.length() > 300 ? r.substring(0, 300) + "..." : r);
+                  }
                }
             }
-         } catch (Exception ignored) {
+         } catch (Exception e) {
+            other.add(e.toString());
          }
-         return false;
+         return "end";
       }, job -> {
          Thread t = new Thread(job, "pzopt-restart");
          t.setDaemon(true);
          t.start();
       });
-      boolean ok;
+      String result;
       try {
-         ok = ready.get(15, TimeUnit.SECONDS);
+         result = ready.get(READY_TIMEOUT_S, TimeUnit.SECONDS);
+      } catch (java.util.concurrent.TimeoutException e) {
+         result = "timeout";
       } catch (Exception e) {
-         ok = false;
+         result = "error " + e;
       }
-      if (ok) {
-         Log.info("restart: helper (pid " + helper.pid() + ") has the command line; its detached part waits for pid " + pid
-               + ", applies a staged " + LauncherJson.NAME + " and starts the game again; log " + LauncherJson.helperLog);
+      long ms = (System.nanoTime() - t0) / 1_000_000;
+      if (result.equals("ready")) {
+         Log.info("restart: helper (pid " + helper.pid() + ") ready after " + ms + " ms: it has the command line; its detached part waits for pid "
+               + pid + ", applies a staged " + LauncherJson.NAME + " and starts the game again; log " + LauncherJson.helperLog);
+         return true;
+      }
+      String why;
+      if (result.equals("none")) {
+         why = "WMI (Get-CimInstance Win32_Process) found no process " + pid;
+      } else if (result.equals("timeout")) {
+         why = "no 'ready' within " + READY_TIMEOUT_S + " s, the helper was still at step '" + step[0] + "'";
       } else {
-         Log.warn("restart: the helper did not read the command line");
-         helper.destroy();
+         Integer code = helper.waitFor(5, TimeUnit.SECONDS) ? helper.exitValue() : null;
+         why = "the helper " + (code != null ? "exited with code " + code : "closed its output") + " before 'ready', at step '" + step[0] + "'";
       }
-      return ok;
+      List<String> tail;
+      synchronized (other) {
+         tail = new ArrayList<>(other.subList(Math.max(0, other.size() - 8), other.size()));
+      }
+      Log.warn("restart: the helper did not get ready after " + ms + " ms: " + why + (tail.isEmpty() ? "" : "; its output: " + String.join(" | ", tail)));
+      helper.destroy();
+      return false;
+   }
+
+   private static final java.util.regex.Pattern CLIXML_ERROR = java.util.regex.Pattern.compile("<S S=\"Error\">(.*?)</S>");
+
+   /**
+    * A helper output line for the log. PowerShell writes errors (and progress records) to a redirected stream as CLIXML
+    * ("#< CLIXML", then one {@code <Objs>} line): keep the text of its error records, drop the rest.
+    */
+   static String readable(String s) {
+      if (s.equals("#< CLIXML")) {
+         return "";
+      }
+      if (!s.startsWith("<Objs")) {
+         return s;
+      }
+      StringBuilder b = new StringBuilder();
+      java.util.regex.Matcher m = CLIXML_ERROR.matcher(s);
+      while (m.find()) {
+         b.append(m.group(1).replace("_x000D__x000A_", " ")).append(' ');
+      }
+      return b.toString().replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+            .replaceAll("\\s+", " ").strip();
    }
 }
