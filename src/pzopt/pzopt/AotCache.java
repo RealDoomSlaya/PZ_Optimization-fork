@@ -39,6 +39,15 @@ import org.json.JSONObject;
  * (aotCache=false, the master switch, a build mismatch) or in a harness run, a JSON in the cache mode is put back to the
  * loose form. The installers (scripts/pzopt.sh, install.sh, install.ps1) and pzopt.Updater do the
  * same before they touch the loose files, so a stale jar can never shadow a newer install.
+ *
+ * Java agents: with a JVMTI or Java agent on the command line (-agentlib, -agentpath, -javaagent; ZombieBuddy's
+ * -agentlib:zbNative) the cache stays off and the launcher loose. Both recording sessions of a Windows install with
+ * ZombieBuddy and Viewpoint crashed the JVM at exit inside HotSpot's cache writer (EXCEPTION_ACCESS_VIOLATION in the
+ * PopulateDumpSharedSpace operation, Zulu 25.0.1; the AOT log listed classes the agent had redefined or transformed),
+ * so no cache was ever written and every other quit crashed. A recording JVM that has an agent anyway (its launcher was
+ * written before the agent was added) does not exit through System.exit, so the writer never runs.
+ * A recording that ends without a cache for any other reason (the use launch finds no file) puts the launcher back to
+ * loose and is not tried again until the fingerprint changes (install, game jar or Java).
  */
 public final class AotCache {
    static final String JAR = "pzopt/aot/pzopt.jar";
@@ -52,31 +61,56 @@ public final class AotCache {
    enum Mode { LOOSE, RECORD, USE }
 
    private static final Mode MODE = detectMode();
+   private static final String AGENT = agent(inputArgs());
    private static volatile boolean started;
 
    private AotCache() {
    }
 
-   private static Mode detectMode() {
+   private static List<String> inputArgs() {
       try {
-         for (String a : ManagementFactory.getRuntimeMXBean().getInputArguments()) {
-            if (a.startsWith("-XX:AOTCacheOutput=") || a.equals("-XX:AOTMode=record")) {
-               return Mode.RECORD;
-            }
-            if (a.startsWith("-XX:AOTCache=")) {
-               return Mode.USE;
-            }
-         }
+         return ManagementFactory.getRuntimeMXBean().getInputArguments();
       } catch (Throwable ignored) {
+         return List.of();
+      }
+   }
+
+   private static Mode detectMode() {
+      for (String a : inputArgs()) {
+         if (a.startsWith("-XX:AOTCacheOutput=") || a.equals("-XX:AOTMode=record")) {
+            return Mode.RECORD;
+         }
+         if (a.startsWith("-XX:AOTCache=")) {
+            return Mode.USE;
+         }
       }
       return Mode.LOOSE;
    }
 
+   /** The first JVMTI or Java agent on the JVM's command line (-agentlib / -agentpath / -javaagent, options cut), else null. */
+   static String agent(List<String> args) {
+      for (String a : args) {
+         if (a.startsWith("-agentlib:") || a.startsWith("-agentpath:") || a.startsWith("-javaagent:")) {
+            int eq = a.indexOf('=');
+            return eq > 0 ? a.substring(0, eq) : a;
+         }
+      }
+      return null;
+   }
+
+   /** Whether this JVM exits through System.exit at the game's exit: a recording one without an agent (see the class doc). */
+   static boolean exitForCache(Mode mode, String agent) {
+      return mode == Mode.RECORD && agent == null;
+   }
+
    /** From GameWindow.exit: a recording JVM exits through System.exit so it writes the cache. */
    public static void onGameExit() {
-      if (MODE == Mode.RECORD) {
+      if (exitForCache(MODE, AGENT)) {
          Log.info("aot: recording session, exiting through System.exit so the JVM writes the AOT cache");
          System.exit(0);
+      } else if (MODE == Mode.RECORD) {
+         Log.info("aot: recording session with " + AGENT + " loaded: not exiting through System.exit, so the JVM skips the cache write"
+               + " (it crashed there with classes an agent had redefined)");
       }
    }
 
@@ -118,22 +152,37 @@ public final class AotCache {
    }
 
    static void step() throws Exception {
-      Path game = Updater.gameDir();
+      step(Updater.gameDir(), MODE, AGENT, wanted());
+   }
+
+   /** One boot's decision for the next launch; {@code mode} is how this JVM was started, {@code agent} its first agent. */
+   static void step(Path game, Mode mode, String agent, boolean wanted) throws Exception {
       Path json = game.resolve("ProjectZomboid64.json");
       if (!Files.isRegularFile(json)) {
          return; // macOS (Info.plist launcher) or an unknown layout: leave it alone
       }
-      if (!wanted()) {
+      if (!wanted) {
          if (resetLauncher(game)) {
             Log.info("aot: cache mode off; launcher back to the loose classes for the next launch");
          }
          return;
       }
+      if (agent != null) {
+         boolean reset = resetLauncher(game);
+         Files.deleteIfExists(game.resolve(CACHE));
+         Log.info("aot: off while " + agent + " is loaded (HotSpot's cache writer crashed at exit with classes an agent had redefined)"
+               + (reset ? "; launcher back to the loose classes for the next launch" : ""));
+         return;
+      }
       String fp = fingerprint(game);
       Properties state = readState(game);
       boolean sameInstall = fp.equals(state.getProperty("fingerprint"));
-      switch (MODE) {
+      switch (mode) {
          case LOOSE -> {
+            if (sameInstall && "failed".equals(state.getProperty("phase"))) {
+               Log.info("aot: off: the last recording session ended without a cache; tried again after the install or Java changes");
+               return;
+            }
             buildJar(game);
             writeLauncher(game, OPT_OUT);
             writeState(game, fp, "record");
@@ -154,6 +203,13 @@ public final class AotCache {
          case USE -> {
             String log = readLog(game);
             boolean used = log.contains("Using AOT-linked classes: true") && !log.contains("Specified AOT cache not found");
+            if (sameInstall && "use".equals(state.getProperty("phase")) && !Files.isRegularFile(game.resolve(CACHE))) {
+               resetLauncher(game);
+               writeState(game, fp, "failed");
+               Log.warn("aot: the recording session ended without a cache (the JVM did not finish writing it; see hs_err_pid*.log"
+                     + " in the game folder); launcher back to the loose classes, tried again after the install or Java changes");
+               return;
+            }
             if (!used || !sameInstall) {
                Files.deleteIfExists(game.resolve(CACHE));
                if (!sameInstall) {
