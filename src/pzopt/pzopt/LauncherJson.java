@@ -288,19 +288,17 @@ final class LauncherJson {
    }
 
    static String psQuote(Path p) {
-      return psQuote(p.toString());
+      String encoded = Base64.getEncoder().encodeToString(p.toString().getBytes(StandardCharsets.UTF_8));
+      return "([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('" + encoded + "')))";
    }
 
-   /**
-    * A PowerShell single-quoted literal. PowerShell ends such a string at ' and at the typographic single quotes U+2018,
-    * U+2019, U+201A and U+201B (checked on Windows PowerShell 5.1); each is doubled.
-    */
+   /** A PowerShell ASCII single-quoted literal. Smart quotes inside it are ordinary path characters. */
    static String psQuote(String s) {
       StringBuilder b = new StringBuilder(s.length() + 8).append('\'');
       for (int i = 0; i < s.length(); i++) {
          char c = s.charAt(i);
          b.append(c);
-         if (c == '\'' || c == '‘' || c == '’' || c == '‚' || c == '‛') {
+         if (c == '\'') {
             b.append(c);
          }
       }

@@ -204,15 +204,11 @@ public final class Uninstall {
    /** The Windows helper's script (written beside the lists as {@link #HELPER_PS1}; it deletes itself at the end). */
    static String windowsScript(long pid, Path files, Path dirs, Path log, Path game) {
       Path aot = game.toAbsolutePath().normalize().resolve("pzopt").resolve("aot");
-      // Java starts this file directly (not an encoded command, which antivirus may block). That first process can
-      // inherit the native launcher's handle on the JSON, so it starts the same file through Start-Process and exits;
-      // the detached second process inherits no game handles and is the one that waits, applies and removes files.
-      return String.join("\n",
-            "param([switch]$PzoptInner)",
-            "if (-not $PzoptInner) {",
-            "  Start-Process -FilePath powershell.exe -WindowStyle Hidden -ArgumentList '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',('`\"' + $PSCommandPath + '`\"'),'-PzoptInner'",
-            "  exit",
-            "}",
+      Path helper = files.resolveSibling(HELPER_PS1).toAbsolutePath().normalize();
+      // Java starts this outer file directly (not an encoded command, which antivirus may block). The outer can
+      // inherit the native launcher's JSON handle, but it only starts the encoded inner through Start-Process and exits;
+      // the detached inner inherits no game handles and is the one that waits, applies and removes files.
+      String inner = String.join("\n",
             LauncherJson.helperPrologue("uninstall", pid),
             "$log = " + quote(log),
             "Add-Content -LiteralPath $log -Encoding UTF8 \"$(Get-Date -Format s) helper started, waiting for pid " + pid + "\"",
@@ -241,7 +237,8 @@ public final class Uninstall {
             "Add-Content -LiteralPath $log -Encoding UTF8 \"$(Get-Date -Format s) uninstall finished; $left files could not be removed\"",
             // a file that could not go stays listed: the next start (pzopt.BootRepair) tries again
             "if ($left -eq 0) { Remove-Item -LiteralPath " + quote(files) + ", " + quote(dirs) + " -Force }",
-            "Remove-Item -LiteralPath $PSCommandPath -Force");
+            "Remove-Item -LiteralPath " + quote(helper) + " -Force");
+      return LauncherJson.detachedOuter(inner);
    }
 
    private static String quote(Path p) {
