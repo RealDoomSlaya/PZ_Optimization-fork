@@ -5026,6 +5026,12 @@ number for this change, and `batched` minus `preClaimed` is this path's own asyn
 the quantity whose near-equality with `batched` was the defect; the pool's global `async helped` line is
 shared with the other batches and must not be used for it.
 
+Key `entityUpdateServer`, default off: an authoritative dedicated or co-op server may use the safe-state entity
+batch and combined pipeline; an MP client is still always excluded. The safe-state whitelist also accepts
+`WalkTowardNetworkState` only in that opted-in server process, alongside the existing idle, walk and pathfind states.
+The player, animal, vehicle, physics, ragdoll, fire, grapple and near-player guards are unchanged. The first hosted
+run proved client-side frame workers while hosting, but a joining client's behavior is not yet covered.
+
 `tests/pzopt/CombinedDispatchTest` pins the machinery at runtime on real moving objects: per-entity
 multiplier and level across two queued groups in one flight, the inline queue's order and per-group
 multiplier with the global restored to one afterwards, the latch's own semantics including that it drops a

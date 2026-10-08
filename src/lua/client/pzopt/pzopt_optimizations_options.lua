@@ -342,6 +342,8 @@ local SECTIONS = {
         entries = {
             { key = "entityUpdateParallel", label = "Entity updates on other cores (experimental)",
               tip = "The update loop itself - the only part of the frame that grows with the whole moving-object population - runs the eligible entities on the worker threads instead of one after another on the game thread, with the stock four-step sequence per entity kept exactly. Players, animals, vehicles and physics objects stay on the game thread; Lua events fired from a worker are replayed on the game thread in the stock order; an entity that fails on a worker turns the batching off for the rest of the session. EXPERIMENTAL: it moves the simulation itself, so it is off by default." },
+            { key = "entityUpdateServer", label = "Entity updates on the server (experimental)",
+              tip = "Allows the authoritative dedicated or co-op server process to use the safe-state entity update workers above. Multiplayer clients always stay serial. Off by default until server networking and mod ordering have more live coverage." },
             { key = "entityUpdatePipeline", label = "Entity updates: overlap with the next batch",
               tip = "With entity updates on other cores, the workers finish one batch while the game thread already collects the next, instead of standing still between batches. The frame-timing multiplier each entity reads is captured per batch, so timings stay exactly right. Only active while the setting above is on." },
             { key = "animalsAfterJoin", label = "Entity updates: animals after the batch",
@@ -1624,6 +1626,7 @@ local EFFECTS = {
     lightingStrongBudget = { cpu = -1, gpu = -2 },
     lightingStrongFrameMs = { gpu = -1 },
     entityUpdateParallel = { cpu = -2, cores = 1 },
+    entityUpdateServer = { cpu = -2, cores = 1 },
     renderPrepParallel = { cpu = -1, cores = 1 },
     pplPackParallel = { cpu = -1, cores = 1 },
     pplTorchNearChunk = { cpu = -1 },

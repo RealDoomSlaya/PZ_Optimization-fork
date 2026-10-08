@@ -367,6 +367,7 @@ PzoptOptionClasses = {
     entityUpdateParallel = { "pzopt.UpdateBatch" },
     entityUpdatePipeline = { "pzopt.UpdateBatch" },
     entityUpdateSafeStates = { "pzopt.UpdateBatch" },
+    entityUpdateServer = { "IsoZombie", "pzopt.UpdateBatch" },
     fileInflight = { "GameLoadingState" },
     fileInflightLoad = { "FileSystemImpl", "GameLoadingState" },
     fileThreads = { "FileSystemImpl", "pzopt.BootPump" },

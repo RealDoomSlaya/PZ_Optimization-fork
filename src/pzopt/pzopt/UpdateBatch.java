@@ -547,7 +547,21 @@ public final class UpdateBatch {
    /** True while a bucket should hand its scheduled entities over instead of walking them itself. */
    public static boolean enabled() {
       return Config.ENTITY_UPDATE_PARALLEL && !failed && Config.effectiveWorkers() > 1
-            && !GameClient.client && !GameServer.server && Overrides.enabled() && GtAb.on(GtAb.ZOMBIE_UPDATE); // devGtAlternate: the within-run A/B
+            && multiplayerAllowed(GameClient.client, GameServer.server, Config.ENTITY_UPDATE_SERVER)
+            && Overrides.enabled() && GtAb.on(GtAb.ZOMBIE_UPDATE); // devGtAlternate: the within-run A/B
+   }
+
+   /** The authoritative server may opt in; an MP client never owns this simulation work. */
+   static boolean multiplayerAllowed(boolean client, boolean server, boolean serverEnabled) {
+      return !client && (!server || serverEnabled);
+   }
+
+   /** Calm states accepted by the safe-state filter; the network walk exists only in the authoritative server loop. */
+   public static boolean safeState(zombie.ai.State state, boolean server, boolean serverEnabled) {
+      return state == zombie.ai.states.ZombieIdleState.instance()
+            || state == zombie.ai.states.WalkTowardState.instance()
+            || state == zombie.ai.states.PathFindState.instance()
+            || server && serverEnabled && state == zombie.ai.states.WalkTowardNetworkState.instance();
    }
 
    /**
